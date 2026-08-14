@@ -1,3 +1,11 @@
+
+
+https://github.com/user-attachments/assets/41e40dbf-7ac8-47a6-9cff-475079512d81
+
+
+
+
+
 # Microplate Analyzer — Mobile App
 
 Ứng dụng Flutter Android chạy pipeline phân tích microplate 3 stages bằng ONNX Runtime,
