@@ -1,0 +1,56 @@
+name: microplate_analyzer
+description: "Microplate image analysis app - 384-well plate detection & classification"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  opencv_dart: ^2.2.1+4
+  # Camera & Image
+  camera: ^0.10.5+5
+  image_picker: ^1.0.7
+  image: ^4.1.7
+
+  # ML & Processing
+  onnxruntime: ^1.4.1  # ONNX Runtime for real ML inference (updated for SDK 34+)
+  permission_handler: ^11.3.0
+
+  # Storage
+  path_provider: ^2.1.2
+  shared_preferences: ^2.2.3
+  sqflite: ^2.3.3+1
+  path: ^1.8.3
+
+  # UI
+  cupertino_icons: ^1.0.6
+  flutter_markdown: ^0.6.14+3
+
+  # Utils
+  intl: ^0.18.1
+  share_plus: ^7.2.1
+  csv: ^5.1.1
+  pdf: ^3.10.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    # ONNX models
+    - assets/models/stage1_grid_fp32.onnx
+    - assets/models/stage2_yolo.onnx
+    - assets/models/stage3_rf_fp32.onnx
+
+  # fonts (optional)
+  # fonts:
+  #   - family: CustomFont
+  #     fonts:
+  #       - asset: fonts/CustomFont-Regular.ttf
