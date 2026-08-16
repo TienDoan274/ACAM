@@ -8,184 +8,184 @@ https://github.com/user-attachments/assets/41e40dbf-7ac8-47a6-9cff-475079512d81
 
 # Microplate Analyzer — Mobile App
 
-Ứng dụng Flutter Android chạy pipeline phân tích microplate 3 stages bằng ONNX Runtime,
-tương đương với `full_pipeline.ipynb` nhưng chạy trực tiếp trên điện thoại.
+Flutter Android application running a 3-stage microplate analysis pipeline using ONNX Runtime,
+equivalent to `full_pipeline.ipynb` but running directly on the phone.
 
-## Kiến trúc pipeline (3 stages)
+## Pipeline Architecture (3 Stages)
 
-| Stage | Mô tả | Model ONNX | Output |
-|-------|-------|------------|--------|
-| **Stage 1 — Warp** | Detect 4 góc plate (EfficientNet-B3 regression) → perspective warp → làm phẳng | `assets/models/stage1_grid_fp32.onnx` | Ảnh gốc (có góc) + ảnh plate đã warp |
-| **Stage 2 — Detect** | YOLOv8 (1 kênh) detect các giếng (wells) trên ảnh đã warp | `assets/models/stage2_yolo.onnx` | Ảnh warp với bounding box từng well (~384 wells) |
-| **Stage 3 — Classify** | RandomForest/ExtraTrees phân loại mỗi well: Growth / NoGrowth / NoAgar | `assets/models/stage3_rf_fp32.onnx` | Ảnh warp với overlay màu theo lớp + bảng đếm |
+| Stage | Description | ONNX Model | Output |
+|-------|-------------|------------|--------|
+| **Stage 1 — Warp** | Detect 4 plate corners (EfficientNet-B3 regression) → perspective warp → flatten | `assets/models/stage1_grid_fp32.onnx` | Original image (with corners) + warped plate image |
+| **Stage 2 — Detect** | YOLOv8 (1 channel) detect wells on warped image | `assets/models/stage2_yolo.onnx` | Warped image with bounding boxes for each well (~384 wells) |
+| **Stage 3 — Classify** | RandomForest/ExtraTrees classify each well: Growth / NoGrowth / NoAgar | `assets/models/stage3_rf_fp32.onnx` | Warped image with color overlay by class + count table |
 
-> **Lưu ý quan trọng (coordinate space):** Stage 2 và 3 thao tác trong **warped space** —
-> bounding box được vẽ trực tiếp lên ảnh đã warp, KHÔNG unwrap về tọa độ gốc. Điều này
-> đảm bảo box khớp hoàn toàn với ảnh hiển thị (giống `full_pipeline.ipynb`).
+> **Important Note (coordinate space):** Stages 2 and 3 operate in **warped space** —
+> bounding boxes are drawn directly on the warped image, NOT unwrapped back to original coordinates.
+> This ensures boxes perfectly match the displayed image (same as `full_pipeline.ipynb`).
 
 ---
 
-## 1. Yêu cầu (Prerequisites)
+## 1. Prerequisites
 
-- **Flutter** ≥ 3.x (`flutter doctor` không lỗi)
-- **Android SDK** + **platform-tools** (có `adb`)
-- **Điện thoại Android**: bật **Developer Options** → **USB Debugging**
-- Cáp USB (hoặc `adb` qua WiFi)
-- Cáp nối điện thoại với máy tính, xác nhận trên điện thoại khi có hộp thoại "Allow USB debugging"
+- **Flutter** ≥ 3.x (`flutter doctor` with no errors)
+- **Android SDK** + **platform-tools** (with `adb`)
+- **Android phone**: enable **Developer Options** → **USB Debugging**
+- USB cable (or `adb` over WiFi)
+- Connect phone to computer, confirm "Allow USB debugging" dialog on phone
 
-Kiểm tra thiết bị đã kết nối:
+Check connected device:
 
 ```bash
 adb devices
-# phải thấy 1 dòng dạng:  f9dcc4ba  device
+# should see a line like:  f9dcc4ba  device
 ```
 
 ---
 
 ## 2. Build APK
 
-Từ thư mục `mobile_app/microplate_analyzer`:
+From `mobile_app/microplate_analyzer` directory:
 
 ```bash
 flutter pub get
 flutter build apk --release
 ```
 
-Kết quả:
+Result:
 
 ```
 √ Built build\app\outputs\flutter-apk\app-release.apk (~128 MB)
 ```
 
-> Bundle lớn (~128 MB) vì chứa 3 model ONNX (~76 MB tổng) + `onnxruntime` native libs.
+> Large bundle (~128 MB) because it contains 3 ONNX models (~76 MB total) + `onnxruntime` native libs.
 
 ---
 
-## 3. Cài app lên điện thoại
+## 3. Install App on Phone
 
-### Cách A — qua `adb` (khuyến nghị, nhanh)
+### Method A — via `adb` (recommended, fast)
 
 ```bash
 adb install -r build/app/outputs/flutter-apk/app-release.apk
 # → Success
 ```
 
-### Cách B — copy thủ công
+### Method B — manual copy
 
-1. Copy file `app-release.apk` sang điện thoại.
-2. Trên điện thoại mở file `.apk` → cấp quyền "Install from unknown sources".
-3. Cài đặt.
+1. Copy `app-release.apk` file to phone.
+2. On phone, open the `.apk` file → grant "Install from unknown sources" permission.
+3. Install.
 
-### Mở app
+### Launch App
 
 ```bash
 adb shell monkey -p com.example.microplate_analyzer -c android.intent.category.LAUNCHER 1
 ```
 
-hoặc chạm icon **Microplate Analyzer** trên màn hình điện thoại.
+or tap the **Microplate Analyzer** icon on phone screen.
 
-> App **khóa landscape** (ngang) vì ảnh microplate dạng rộng.
-
----
-
-## 4. Chạy pipeline từng bước
-
-Mở app → màn hình chính là **Pipeline**. Thanh điều hướng nằm trong **Drawer** (icon ☰ góc trên-trái).
-
-### Bước 0 — Chọn ảnh
-
-1. Mở Drawer (☰) → **Select Image**.
-2. Chạm **Select Image** → chọn ảnh microplate từ thư viện.
-3. Sau khi chọn, các stage phía sau tự reset.
-
-### Bước 1 — Stage 1: Warp (Corner detection + warp)
-
-1. Mở Drawer → **Stage 1: Warp**.
-2. Chạm **Run Stage 1**. (lần đầu có thể chậm vài giây để load model)
-3. Output: **hai ảnh cạnh nhau**
-   - **Trái** — *Original + Corners*: ảnh gốc với 4 góc được detect (chấm vàng + viền polygon).
-   - **Phải** — *Warped Plate*: ảnh plate đã được crop + làm phẳng.
-
-> Có thể **pinch-zoom / pan** từng ảnh. Chạm **Reset** để chạy lại Stage 1 (sẽ reset cả 2 & 3).
-
-### Bước 2 — Stage 2: Detect (Well detection)
-
-1. Mở Drawer → **Stage 2: Detect** (chỉ kích hoạt sau Stage 1 xong).
-2. Chạm **Run Stage 2**.
-3. Output: **ảnh warp full-screen** với bounding box quanh mỗi well + badge góc trên "N wells"
-   (thường ~384 wells cho plate 16×24).
-
-### Bước 3 — Stage 3: Classify (Phân loại)
-
-1. Mở Drawer → **Stage 3: Classify** (chỉ kích hoạt sau Stage 2 xong).
-2. Chạm **Run Stage 3**.
-3. Output: **ảnh warp full-screen** với overlay màu theo lớp:
-   - 🟢 Xanh lá — **Growth**
-   - 🔴 Đỏ — **NoGrowth**
-   - 🟣 Tím — **NoAgar**
-4. Badge góc trên-trái: `G:N  N:N  A:N` (số lượng mỗi lớp).
-5. Hộp thoại **Pipeline Complete** hiện tổng kết → chạm **View Results** để xem chi tiết
-   (bảng phân loại, xuất CSV/PDF, lưu vào History).
+> App is **locked to landscape** mode because microplate images are wide format.
 
 ---
 
-## 5. Xem kết quả & History
+## 4. Running Pipeline Step by Step
 
-- **View Results** (từ Drawer khi đã xong Stage 3, hoặc nút cuối màn hình Stage 3):
-  màn hình chi tiết với ảnh annotated + thống kê + xuất file.
-- Tab **History** (thanh dưới): lưu lại các lần chạy (SQLite cục bộ trên máy).
-- Tab **Settings**: cấu hình model/tham số.
+Open app → main screen is **Pipeline**. Navigation menu is in **Drawer** (☰ icon at top-left).
+
+### Step 0 — Select Image
+
+1. Open Drawer (☰) → **Select Image**.
+2. Tap **Select Image** → choose microplate image from gallery.
+3. After selection, subsequent stages are automatically reset.
+
+### Step 1 — Stage 1: Warp (Corner detection + warp)
+
+1. Open Drawer → **Stage 1: Warp**.
+2. Tap **Run Stage 1**. (first run may be slow, loading model takes a few seconds)
+3. Output: **two images side by side**
+   - **Left** — *Original + Corners*: original image with 4 detected corners (yellow dots + polygon border).
+   - **Right** — *Warped Plate*: plate image after crop + flatten.
+
+> You can **pinch-zoom / pan** each image. Tap **Reset** to re-run Stage 1 (will also reset stages 2 & 3).
+
+### Step 2 — Stage 2: Detect (Well detection)
+
+1. Open Drawer → **Stage 2: Detect** (only enabled after Stage 1 completes).
+2. Tap **Run Stage 2**.
+3. Output: **full-screen warped image** with bounding boxes around each well + badge at top "N wells"
+   (usually ~384 wells for a 16×24 plate).
+
+### Step 3 — Stage 3: Classify (Classification)
+
+1. Open Drawer → **Stage 3: Classify** (only enabled after Stage 2 completes).
+2. Tap **Run Stage 3**.
+3. Output: **full-screen warped image** with color overlay by class:
+   - 🟢 Green — **Growth**
+   - 🔴 Red — **NoGrowth**
+   - 🟣 Purple — **NoAgar**
+4. Badge at top-left: `G:N  N:N  A:N` (count for each class).
+5. **Pipeline Complete** dialog shows summary → tap **View Results** to see details
+   (classification table, export CSV/PDF, save to History).
 
 ---
 
-## 6. Xem log khi debug
+## 5. Viewing Results & History
+
+- **View Results** (from Drawer after Stage 3 completes, or button at bottom of Stage 3 screen):
+  detailed screen with annotated image + statistics + file export.
+- Tab **History** (bottom bar): saves previous runs (local SQLite on device).
+- Tab **Settings**: model configuration/parameters.
+
+---
+
+## 6. Viewing Logs When Debugging
 
 ```bash
 adb logcat -c                       # clear
 adb logcat -v time Pipeline:V flutter:V AndroidRuntime:E *:S
 ```
 
-Từ mã nguồn có các log dấu vết:
+From source code, look for trace logs:
 - `[Pipeline] Stage 2 detected N wells (warped space)`
 - `[Pipeline] Stage 2 visualization saved to: .../stage2_detection_*.png`
 
 ---
 
-## 7. Khắc phục sự cố (Troubleshooting)
+## 7. Troubleshooting
 
-| Triệu chứng | Nguyên nhân / Khắc phục |
-|-------------|------------------------|
-| `no devices/emulators found` | Kiểm tra cáp, bật USB Debugging, đồng ý hộp thoại "Allow debugging" trên điện thoại. `adb kill-server && adb devices` |
-| App cũ vẫn chạy (không thấy fix) | Chạy `adb install -r ...` lại; đảm bảo build mới nhất đã cài (`adb shell am force-stop com.example.microplate_analyzer` rồi mở lại) |
-| Stage không kích hoạt | Phải làm tuần tự: Stage 1 → 2 → 3. Mỗi stage cần stage trước hoàn tất. |
-| Ảnh visualize không hiện | Kiểm tra logcat xem có `visualization saved to:` không; nếu có mà vẫn không thấy → đang chạy bản build cũ, build + install lại |
-| Load model chậm/lỗi lần đầu | Model load ở `main()`; lần mở đầu có thể mất vài giây. Nếu crash → kiểm tra 3 file ONNX còn trong `assets/models/` |
-| App crash | `adb logcat -v time AndroidRuntime:E *:S` để xem stack trace |
+| Symptom | Cause / Fix |
+|---------|--------------|
+| `no devices/emulators found` | Check cable, enable USB Debugging, accept "Allow debugging" dialog on phone. `adb kill-server && adb devices` |
+| Old app still running (don't see fixes) | Run `adb install -r ...` again; ensure latest build is installed (`adb shell am force-stop com.example.microplate_analyzer` then reopen) |
+| Stages not enabled | Must run sequentially: Stage 1 → 2 → 3. Each stage requires previous stage completion. |
+| Visualization images not showing | Check logcat for `visualization saved to:`; if exists but still not visible → running old build, rebuild + reinstall |
+| Slow model load/error on first run | Models load in `main()`; first launch may take a few seconds. If crash → check 3 ONNX files still in `assets/models/` |
+| App crash | `adb logcat -v time AndroidRuntime:E *:S` to view stack trace |
 
 ---
 
-## 8. Cấu trúc mã nguồn chính
+## 8. Main Source Code Structure
 
 ```
 lib/
-├── main.dart                      # Khởi tạo app, load model, landscape lock
+├── main.dart                      # App initialization, model loading, landscape lock
 ├── screens/
-│   ├── pipeline_screen.dart       # UI 3 stages + Drawer điều hướng
-│   ├── results_screen.dart        # Màn hình kết quả chi tiết
-│   ├── history_screen.dart        # Lịch sử (SQLite)
-│   └── settings_screen.dart       # Cấu hình
+│   ├── pipeline_screen.dart       # 3-stage UI + Drawer navigation
+│   ├── results_screen.dart        # Detailed results screen
+│   ├── history_screen.dart        # History (SQLite)
+│   └── settings_screen.dart       # Configuration
 ├── models/
 │   ├── inference_service.dart     # ONNX: detectAutoGrid, detectYoloWarped,
 │   │                              #       classifyWarpedWells, warpPlateAndSave
 │   └── database_helper.dart       # SQLite history
 └── utils/
     ├── image_utils.dart           # drawCorners, drawWellBoxes, warp, save
-    └── constants.dart             # Tham số (PLATE_MARGIN, rows/cols, ...)
+    └── constants.dart             # Parameters (PLATE_MARGIN, rows/cols, ...)
 ```
 
-### Các hàm pipeline cốt lõi (trong `inference_service.dart`)
+### Core Pipeline Functions (in `inference_service.dart`)
 
-- `detectAutoGrid(imagePath)` → `Detection` (4 góc, grid positions) — Stage 1
-- `warpPlateAndSave(imagePath, corners)` → đường dẫn ảnh warp — Stage 1
-- `detectYoloWarped(imagePath, corners)` → `WarpedDetection` (boxes trong warped space) — Stage 2
-- `classifyWarpedWells(WarpedDetection)` → classes + counts + ảnh annotated — Stage 3
+- `detectAutoGrid(imagePath)` → `Detection` (4 corners, grid positions) — Stage 1
+- `warpPlateAndSave(imagePath, corners)` → warped image path — Stage 1
+- `detectYoloWarped(imagePath, corners)` → `WarpedDetection` (boxes in warped space) — Stage 2
+- `classifyWarpedWells(WarpedDetection)` → classes + counts + annotated image — Stage 3
