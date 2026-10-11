@@ -133,11 +133,29 @@ class GridTransform {
 /// Database schema
 class DatabaseSchema {
   static const String dbName = 'microplate_history.db';
-  static const int dbVersion = 1;
+  static const int dbVersion = 7;
 
+  // Projects table
+  static const String tableProjects = 'projects';
+  static const String colProjectId = 'id';
+  static const String colProjectName = 'name';
+  static const String colProjectDescription = 'description';
+  static const String colProjectCreatedAt = 'created_at';
+  static const String colProjectUpdatedAt = 'updated_at';
+  static const String colProjectColor = 'color';
+
+  // Project images table
+  static const String tableProjectImages = 'project_images';
+  static const String colImageId = 'id';
+  static const String colImageProjectId = 'project_id';
+  static const String colImagePath = 'image_path';
+  static const String colImageStatus = 'status';
+  static const String colImageCreatedAt = 'created_at';
+
+  // Results table
   static const String tableResults = 'results';
   static const String colId = 'id';
-  static const String colImagePath = 'image_path';
+  static const String colResultImagePath = 'image_path';
   static const String colAnnotatedPath = 'annotated_path';
   static const String colTimestamp = 'timestamp';
   static const String colTotal = 'total_wells';
@@ -145,18 +163,142 @@ class DatabaseSchema {
   static const String colNoGrowth = 'no_growth_count';
   static const String colNoAgar = 'no_agar_count';
   static const String colProcessingTime = 'processing_time_ms';
+  static const String colResultProjectId = 'project_id';
+  static const String colResultImageId = 'image_id';
+  static const String colResultPipelineImageId = 'pipeline_image_id';
+  static const String colResultDeletedAt = 'deleted_at';
 
-  static const String createTableSQL = '''
+  // Pipeline folders table
+  static const String tablePipelineFolders = 'pipeline_folders';
+  static const String colFolderId = 'id';
+  static const String colFolderName = 'name';
+  static const String colFolderParentId = 'parent_id';
+  static const String colFolderPosition = 'position';
+  static const String colFolderCreatedAt = 'created_at';
+
+  // Pipeline images table
+  static const String tablePipelineImages = 'pipeline_images';
+  static const String colPipelineImageId = 'id';
+  static const String colPipelineImageFolderId = 'folder_id';
+  static const String colPipelineImageProjectId = 'project_id';
+  static const String colPipelineImagePath = 'image_path';
+  static const String colPipelineStage1Status = 'stage1_status';
+  static const String colPipelineStage2Status = 'stage2_status';
+  static const String colPipelineStage3Status = 'stage3_status';
+  static const String colPipelineStage1Output = 'stage1_output_path';
+  static const String colPipelineStage2Output = 'stage2_output_path';
+  static const String colPipelineStage3Output = 'stage3_output_path';
+  static const String colPipelineStage3Summary = 'stage3_summary';
+  static const String colPipelineStage3ConfPath = 'stage3_conf_path';
+  // v7: JSON kết quả từng stage (StageMeta trong lib/models/stage_meta.dart): nguồn auto/manual,
+  // góc Stage 1 + ảnh warp, đường dẫn file box Stage 2 — để Stage 2/3 không phải chạy lại model
+  static const String colPipelineStage1Meta = 'stage1_meta';
+  static const String colPipelineStage2Meta = 'stage2_meta';
+  static const String colPipelineImageCreatedAt = 'created_at';
+  static const String colPipelineImageUpdatedAt = 'updated_at';
+  static const String colPipelineImageDeletedAt = 'deleted_at';
+
+  // Create table SQL statements
+  static const String createPipelineFoldersTableSQL = '''
+    CREATE TABLE $tablePipelineFolders (
+      $colFolderId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colFolderName TEXT NOT NULL,
+      $colFolderParentId INTEGER,
+      $colFolderPosition INTEGER NOT NULL DEFAULT 0,
+      $colFolderCreatedAt INTEGER NOT NULL,
+      FOREIGN KEY ($colFolderParentId) REFERENCES $tablePipelineFolders($colFolderId) ON DELETE CASCADE
+    )
+  ''';
+
+  static const String createPipelineImagesTableSQL = '''
+    CREATE TABLE IF NOT EXISTS $tablePipelineImages (
+      $colPipelineImageId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colPipelineImageFolderId INTEGER,
+      $colPipelineImageProjectId INTEGER,
+      $colPipelineImagePath TEXT NOT NULL UNIQUE,
+      $colPipelineStage1Status TEXT DEFAULT 'pending',
+      $colPipelineStage2Status TEXT DEFAULT 'pending',
+      $colPipelineStage3Status TEXT DEFAULT 'pending',
+      $colPipelineStage1Output TEXT,
+      $colPipelineStage2Output TEXT,
+      $colPipelineStage3Output TEXT,
+      $colPipelineStage3Summary TEXT,
+      $colPipelineStage3ConfPath TEXT,
+      $colPipelineStage1Meta TEXT,
+      $colPipelineStage2Meta TEXT,
+      $colPipelineImageCreatedAt INTEGER NOT NULL,
+      $colPipelineImageUpdatedAt INTEGER NOT NULL,
+      $colPipelineImageDeletedAt INTEGER,
+      FOREIGN KEY ($colPipelineImageFolderId) REFERENCES $tablePipelineFolders($colFolderId) ON DELETE SET NULL
+    )
+  ''';
+
+  static const String createProjectsTableSQL = '''
+    CREATE TABLE $tableProjects (
+      $colProjectId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colProjectName TEXT NOT NULL,
+      $colProjectDescription TEXT,
+      $colProjectCreatedAt INTEGER NOT NULL,
+      $colProjectUpdatedAt INTEGER NOT NULL,
+      $colProjectColor INTEGER DEFAULT 0xFF4CAF50
+    )
+  ''';
+
+  static const String createProjectImagesTableSQL = '''
+    CREATE TABLE $tableProjectImages (
+      $colImageId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colImageProjectId INTEGER NOT NULL,
+      $colImagePath TEXT NOT NULL,
+      $colImageStatus TEXT DEFAULT 'pending',
+      $colImageCreatedAt INTEGER NOT NULL,
+      FOREIGN KEY ($colImageProjectId) REFERENCES $tableProjects($colProjectId) ON DELETE CASCADE
+    )
+  ''';
+
+  static const String createResultsTableSQL = '''
     CREATE TABLE $tableResults (
       $colId INTEGER PRIMARY KEY AUTOINCREMENT,
-      $colImagePath TEXT NOT NULL,
+      $colResultImagePath TEXT NOT NULL,
       $colAnnotatedPath TEXT,
       $colTimestamp INTEGER NOT NULL,
       $colTotal INTEGER NOT NULL,
       $colGrowth INTEGER NOT NULL,
       $colNoGrowth INTEGER NOT NULL,
       $colNoAgar INTEGER NOT NULL,
-      $colProcessingTime REAL
+      $colProcessingTime REAL,
+      $colResultProjectId INTEGER,
+      $colResultImageId INTEGER,
+      $colResultPipelineImageId INTEGER,
+      $colResultDeletedAt INTEGER,
+      FOREIGN KEY ($colResultProjectId) REFERENCES $tableProjects($colProjectId),
+      FOREIGN KEY ($colResultImageId) REFERENCES $tableProjectImages($colImageId)
     )
+  ''';
+
+  // Migration SQL
+  static const String migrateV1ToV2 = '''
+    -- Add project_id and image_id columns to results table
+    ALTER TABLE $tableResults ADD COLUMN $colResultProjectId INTEGER;
+    ALTER TABLE $tableResults ADD COLUMN $colResultImageId INTEGER;
+
+    -- Create projects table
+    CREATE TABLE IF NOT EXISTS $tableProjects (
+      $colProjectId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colProjectName TEXT NOT NULL,
+      $colProjectDescription TEXT,
+      $colProjectCreatedAt INTEGER NOT NULL,
+      $colProjectUpdatedAt INTEGER NOT NULL,
+      $colProjectColor INTEGER DEFAULT 0xFF4CAF50
+    );
+
+    -- Create project_images table
+    CREATE TABLE IF NOT EXISTS $tableProjectImages (
+      $colImageId INTEGER PRIMARY KEY AUTOINCREMENT,
+      $colImageProjectId INTEGER NOT NULL,
+      $colImagePath TEXT NOT NULL,
+      $colImageStatus TEXT DEFAULT 'pending',
+      $colImageCreatedAt INTEGER NOT NULL,
+      FOREIGN KEY ($colImageProjectId) REFERENCES $tableProjects($colProjectId) ON DELETE CASCADE
+    );
   ''';
 }

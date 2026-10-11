@@ -13,6 +13,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:image/image.dart' as img;
 
 import '../models/inference_service.dart';
+import '../models/database_helper.dart';
 import '../utils/constants.dart';
 import '../utils/image_utils.dart';
 import 'results_screen.dart';
@@ -35,11 +36,20 @@ enum PipelineStage {
   const PipelineStage(this.label, this.icon);
 }
 
-class _PipelineScreenState extends State<PipelineScreen> {
+class _PipelineScreenState extends State<PipelineScreen>
+    with AutomaticKeepAliveClientMixin {
   PipelineStage _currentStage = PipelineStage.selectFile;
 
-  // Pipeline state (persists across stages)
-  File? _inputImage;
+  // Batch processing state
+  List<File> _inputImages = [];
+  int _currentImageIndex = 0;
+  List<PipelineResult> _batchResults = [];
+  Map<int, String> _imageStatus = {}; // image_index -> status message
+
+  // Pipeline state (persists across stages) - for current image
+  File? get _inputImage => _currentImageIndex < _inputImages.length
+      ? _inputImages[_currentImageIndex]
+      : null;
   List<Map<String, double>>? _corners;
   File? _originalWithCorners; // Stage 1: original with detected corners drawn
   File? _warpedImage;
@@ -53,7 +63,11 @@ class _PipelineScreenState extends State<PipelineScreen> {
   bool _isProcessing = false;
   String _statusMessage = '';
 
+  // Full pipeline option
+  bool _autoRunAllStages = false;
+
   final InferenceService _inferenceService = InferenceService();
+  final DatabaseHelper _db = DatabaseHelper();
 
   // Determine which stages are complete
   bool get _hasStage1 => _corners != null && _warpedImage != null;
@@ -69,7 +83,11 @@ class _PipelineScreenState extends State<PipelineScreen> {
   }
 
   @override
+  bool get wantKeepAlive => true;
+
+  @override
   Widget build(BuildContext context) {
+    super.build(context); // Required for AutomaticKeepAliveClientMixin
     // Mobile-first: always use drawer navigation for better UX
     return Scaffold(
       appBar: AppBar(
@@ -90,6 +108,13 @@ class _PipelineScreenState extends State<PipelineScreen> {
       ),
       drawer: _buildMobileDrawer(),
       body: _buildCurrentStage(),
+      floatingActionButton: _inputImage != null
+          ? FloatingActionButton.extended(
+              onPressed: _isProcessing ? null : _runFullPipelineSequential,
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('Run Full Pipeline'),
+            )
+          : null,
     );
   }
 
@@ -184,6 +209,28 @@ class _PipelineScreenState extends State<PipelineScreen> {
                 onTap: () {
                   Navigator.pop(context);
                   _viewFinalResults();
+                },
+              ),
+            // Run Full Pipeline button
+            if (_inputImage != null)
+              ListTile(
+                leading: const Icon(Icons.play_arrow),
+                title: const Text('Run Full Pipeline'),
+                subtitle: const Text('Run all stages automatically'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _runFullPipelineSequential();
+                },
+              ),
+            // Batch processing button
+            if (_inputImages.length > 1)
+              ListTile(
+                leading: const Icon(Icons.play_circle_outline),
+                title: Text('Process All ${_inputImages.length} Images'),
+                subtitle: const Text('Run batch processing'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _runBatchPipeline();
                 },
               ),
           ],
@@ -346,6 +393,10 @@ class _PipelineScreenState extends State<PipelineScreen> {
     final hasImage = _inputImage != null;
     final iconSize = _getResponsiveIconSize(context);
     final fileName = hasImage ? _inputImage!.path.split('/').last : '';
+    final imageCount = _inputImages.length;
+    final batchInfo = imageCount > 1
+        ? ' (${_currentImageIndex + 1}/$imageCount)'
+        : '';
 
     return Stack(
       children: [
@@ -379,7 +430,7 @@ class _PipelineScreenState extends State<PipelineScreen> {
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
-                fileName,
+                '$fileName$batchInfo',
                 style: const TextStyle(
                   color: Colors.white,
                   fontSize: 12,
@@ -389,31 +440,34 @@ class _PipelineScreenState extends State<PipelineScreen> {
             ),
           ),
 
-        // Action button (bottom-center)
+        // Action buttons (bottom-center)
         Positioned(
           bottom: 8,
           left: 0,
           right: 0,
           child: Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
+                // Camera button
                 ElevatedButton.icon(
-                  onPressed: _isProcessing ? null : _pickInputFile,
-                  icon: Icon(hasImage ? Icons.swap_horiz : Icons.file_open),
-                  label: Text(hasImage ? 'Change Image' : 'Select Image'),
+                  onPressed: _isProcessing ? null : _pickCameraImage,
+                  icon: const Icon(Icons.camera_alt),
+                  label: const Text('Camera'),
                   style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                   ),
                 ),
-                if (hasImage)
-                  const Padding(
-                    padding: EdgeInsets.only(top: 6),
-                    child: Text(
-                      'Open the menu (☰) to run Stage 1',
-                      style: TextStyle(fontSize: 12, color: Colors.grey),
-                    ),
+                const SizedBox(width: 12),
+                // Gallery button
+                ElevatedButton.icon(
+                  onPressed: _isProcessing ? null : _pickInputFile,
+                  icon: Icon(hasImage ? Icons.swap_horiz : Icons.photo_library),
+                  label: Text(hasImage ? 'Change' : 'Gallery'),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                   ),
+                ),
               ],
             ),
           ),
@@ -654,23 +708,154 @@ class _PipelineScreenState extends State<PipelineScreen> {
 
   Future<void> _pickInputFile() async {
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.gallery);
+    final picked = await picker.pickMultiImage();
 
-    if (picked != null) {
+    if (picked.isNotEmpty) {
       setState(() {
-        _inputImage = File(picked.path);
-        // Reset all downstream stages
-        _corners = null;
-        _originalWithCorners = null;
-        _warpedImage = null;
-        _warpedDetection = null;
-        _stage2Visualization = null;
-        _classes = null;
-        _counts = null;
-        _finalVisualization = null;
+        _inputImages = picked.map((x) => File(x.path)).toList();
+        _currentImageIndex = 0;
+        _batchResults = [];
+        _imageStatus = {};
+
+        // Initialize status for all images
+        for (int i = 0; i < _inputImages.length; i++) {
+          _imageStatus[i] = 'Pending';
+        }
+
+        // Reset all downstream stages for current image
+        _resetCurrentImageStages();
       });
     }
   }
+
+  Future<void> _pickCameraImage() async {
+    final picker = ImagePicker();
+    final picked = await picker.pickImage(
+      source: ImageSource.camera,
+      imageQuality: 90,
+    );
+
+    if (picked != null) {
+      setState(() {
+        _inputImages = [File(picked.path)];
+        _currentImageIndex = 0;
+        _batchResults = [];
+        _imageStatus = {0: 'Pending'};
+        _resetCurrentImageStages();
+      });
+    }
+  }
+
+  void _resetCurrentImageStages() {
+    _corners = null;
+    _originalWithCorners = null;
+    _warpedImage = null;
+    _warpedDetection = null;
+    _stage2Visualization = null;
+    _classes = null;
+    _counts = null;
+    _finalVisualization = null;
+  }
+
+  Future<void> _runBatchPipeline() async {
+    for (int i = 0; i < _inputImages.length; i++) {
+      setState(() {
+        _currentImageIndex = i;
+        _imageStatus[i] = 'Processing ${i+1}/${_inputImages.length}...';
+        _statusMessage = 'Image ${i+1}/${_inputImages.length}';
+      });
+
+      // Reset stages for this image
+      _resetCurrentImageStages();
+
+      // Run full pipeline on current image
+      await _runFullPipelineOnCurrent();
+
+      _imageStatus[i] = 'Completed';
+    }
+
+    setState(() {
+      _statusMessage = 'Batch completed: ${_batchResults.length} images';
+    });
+
+    _showBatchCompletionDialog();
+  }
+
+  Future<void> _runFullPipelineOnCurrent() async {
+    if (_inputImage == null) return;
+
+    try {
+      // Stage 1
+      await _runStage1();
+      if (!mounted) return;
+
+      // Stage 2
+      await _runStage2();
+      if (!mounted) return;
+
+      // Stage 3
+      await _runStage3(showDialog: false);
+      if (!mounted) return;
+
+      // Store result
+      if (_classes != null && _counts != null && _finalVisualization != null) {
+        final result = PipelineResult(
+          imagePath: _inputImage!.path,
+          annotatedPath: _finalVisualization!.path,
+          boxes: _warpedDetection?.warpedBoxes.map((box) => {
+            'x1': box['x1'],
+            'y1': box['y1'],
+            'x2': box['x2'],
+            'y2': box['y2'],
+          }).toList() ?? [],
+          classes: _classes!,
+          counts: _counts!,
+          processingTimeMs: 0.0,
+          corners: _corners ?? [],
+          mode: DetectionMode.yoloDetect,
+        );
+        _batchResults.add(result);
+      }
+    } catch (e) {
+      print('[Batch] Error processing image $_currentImageIndex: $e');
+      _imageStatus[_currentImageIndex] = 'Failed: $e';
+    }
+  }
+
+  void _showBatchCompletionDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Batch Processing Complete'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Total images: ${_inputImages.length}'),
+            const SizedBox(height: 8),
+            Text('Successfully processed: ${_batchResults.length}'),
+            const SizedBox(height: 8),
+            Text('Failed: ${_inputImages.length - _batchResults.length}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+          if (_batchResults.isNotEmpty)
+            FilledButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                // TODO: Show results grid or save to project
+              },
+              child: const Text('View Results'),
+            ),
+        ],
+      ),
+    );
+  }
+
 
   Future<void> _runStage1() async {
     setState(() {
@@ -709,9 +894,12 @@ class _PipelineScreenState extends State<PipelineScreen> {
           _warpedImage = File(warpedPath);
           _isProcessing = false;
           _statusMessage = '';
-
-          // Stay on current stage to view output
         });
+
+        // Auto-advance to Stage 2 if enabled
+        if (_autoRunAllStages) {
+          await _runStage2();
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -762,6 +950,11 @@ class _PipelineScreenState extends State<PipelineScreen> {
           _isProcessing = false;
           _statusMessage = '';
         });
+
+        // Auto-advance to Stage 3 if enabled
+        if (_autoRunAllStages) {
+          await _runStage3();
+        }
       }
     } catch (e, stackTrace) {
       print('[Pipeline] Stage 2 failed: $e');
@@ -778,7 +971,30 @@ class _PipelineScreenState extends State<PipelineScreen> {
     }
   }
 
-  Future<void> _runStage3() async {
+  /// Auto-save the completed run to History (every run: single, sequential, batch)
+  Future<void> _saveRunToHistory() async {
+    if (_inputImage == null || _classes == null || _counts == null || _finalVisualization == null) {
+      return;
+    }
+    try {
+      final entry = HistoryEntry(
+        imagePath: _inputImage!.path,
+        annotatedPath: _finalVisualization!.path,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        totalWells: _warpedDetection?.warpedBoxes.length ?? 0,
+        growthCount: _counts!['growth'] ?? 0,
+        noGrowthCount: _counts!['no_growth'] ?? 0,
+        noAgarCount: _counts!['no_agar'] ?? 0,
+        processingTimeMs: null,
+        projectId: null,
+      );
+      await _db.insertResult(entry);
+    } catch (e) {
+      print('[Pipeline] Auto-save to history failed: $e');
+    }
+  }
+
+  Future<void> _runStage3({bool showDialog = true}) async {
     setState(() {
       _isProcessing = true;
       _statusMessage = 'Running Stage 3: Classifying wells...';
@@ -798,7 +1014,12 @@ class _PipelineScreenState extends State<PipelineScreen> {
           _statusMessage = '';
         });
 
-        _showCompletionDialog();
+        // Every completed run is auto-saved to History (no option needed)
+        await _saveRunToHistory();
+
+        if (showDialog) {
+          _showCompletionDialog();
+        }
       }
     } catch (e) {
       if (mounted) {
@@ -863,6 +1084,52 @@ class _PipelineScreenState extends State<PipelineScreen> {
           builder: (context) => ResultsScreen(result: pipelineResult),
         ),
       );
+    }
+  }
+
+  Future<void> _runFullPipelineSequential() async {
+    if (_inputImage == null || _isProcessing) return;
+
+    setState(() {
+      _isProcessing = true;
+      _statusMessage = 'Running full pipeline...';
+    });
+
+    try {
+      // Stage 1
+      await _runStage1();
+      if (!mounted) return;
+
+      // Stage 2
+      await _runStage2();
+      if (!mounted) return;
+
+      // Stage 3
+      await _runStage3(showDialog: false);
+      if (!mounted) return;
+
+      setState(() {
+        _statusMessage = 'Pipeline completed!';
+      });
+
+      _showCompletionDialog();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = '';
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Pipeline failed: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isProcessing = false;
+          _statusMessage = '';
+        });
+      }
     }
   }
 

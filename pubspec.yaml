@@ -44,10 +44,16 @@ flutter:
   uses-material-design: true
 
   assets:
-    # ONNX models
-    - assets/models/stage1_grid_fp32.onnx
-    - assets/models/stage2_yolo.onnx
-    - assets/models/stage3_rf_fp32.onnx
+    # ONNX models + config — sinh bởi `python pipelines/40_export_models.py --to-app` (repo cha)
+    - assets/models/stage1_corners.onnx
+    - assets/models/stage2_wells.onnx
+    - assets/models/stage3_classifier.onnx
+    - assets/models/pipeline_config.json
+    - assets/models/model_manifest.json
+    # UI icons
+    - assets/icons/select_all.png
+    # Ảnh mẫu cho chế độ chỉnh tay — sinh bởi `python pipelines/tools/make_help_images.py` (repo cha)
+    - assets/help/
 
   # fonts (optional)
   # fonts:

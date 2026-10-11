@@ -1,0 +1,166 @@
+{
+  "version": 3,
+  "grid": {
+    "rows": 16,
+    "cols": 24,
+    "n_wells": 384,
+    "row_letters": "ABCDEFGHIJKLMNOP",
+    "template_corners_uv": [
+      [
+        0.081076,
+        0.094567
+      ],
+      [
+        0.916435,
+        0.097304
+      ],
+      [
+        0.915042,
+        0.91088
+      ],
+      [
+        0.079162,
+        0.910492
+      ]
+    ],
+    "template_order": [
+      "A1",
+      "A24",
+      "P24",
+      "P1"
+    ],
+    "gates_pitch": [
+      0.5,
+      0.4,
+      0.35
+    ],
+    "snap_tol_pitch": 0.2,
+    "max_refine": 8,
+    "coarse_align_min_conf": 0.25,
+    "coarse_align_scale_clip": [
+      0.8,
+      1.25
+    ],
+    "phase_radius": 4,
+    "grow_radii": [
+      2,
+      4,
+      6,
+      9,
+      12
+    ],
+    "grow_homography_from": 6
+  },
+  "input": {
+    "max_image_side": 4800,
+    "resize": "cạnh dài > max_image_side -> thu về max_image_side, INTER_AREA, làm tròn .5 lên; ảnh sau bước này = ảnh làm việc (mọi toạ độ pipeline)"
+  },
+  "quality": {
+    "s1_aspect_range": [
+      1.2,
+      1.85
+    ],
+    "s1_min_area_frac": 0.02,
+    "s1_angle_range_deg": [
+      70,
+      110
+    ],
+    "s2_max_interp_frac": 0.2,
+    "s2_max_snap_frac": 0.05,
+    "s2_min_pitch_px": 26
+  },
+  "manual": {
+    "max_per_axis": 64,
+    "pitch_ratio_range": [
+      0.8,
+      1.25
+    ],
+    "anchors": "① đầu-trái, ② đầu-phải cùng hàng, ③ cuối-trái cùng cột; n12/n13 = số well ①→② / ①→③",
+    "hybrid": "lưới 16x24 (hướng nào cũng được) + refine -> H0 = anchor_homography rồi complete_grid với YOLO"
+  },
+  "classes": [
+    {
+      "id": 0,
+      "name": "Growth",
+      "color_rgb": "#00AA00"
+    },
+    {
+      "id": 1,
+      "name": "NoGrowth",
+      "color_rgb": "#DC0000"
+    },
+    {
+      "id": 2,
+      "name": "NoAgar",
+      "color_rgb": "#C800C8"
+    }
+  ],
+  "stage1": {
+    "model": "stage1_corners.onnx",
+    "input": "input",
+    "output": "corners",
+    "img_size": 896,
+    "gray": "cv::cvtColor RGB2GRAY (uint8)",
+    "resize": "INTER_LINEAR_EXACT, không giữ tỉ lệ (INTER_LINEAR trên ARM lệch x86 ±1 mức xám)",
+    "canvas_aspect": 1.5,
+    "aspect_tol": 0.03,
+    "pad_border_frac": 0.02,
+    "canvas": "trước khi resize: ảnh dọc -> ROTATE_90_CLOCKWISE; |w/h / canvas_aspect - 1| > aspect_tol -> copyMakeBorder CONSTANT = trung vị dưới viền pad_border_frac cạnh ngắn (acam.inference.stage1_frame)",
+    "normalize": {
+      "mean": 0.485,
+      "std": 0.229,
+      "formula": "(gray/255 - mean)/std"
+    },
+    "output_format": "8 số sigmoid: (x,y) chuẩn hoá theo kích thước KHUNG Stage 1 -> px khung -> px ảnh (bỏ xoay / nền); sắp lại TL,TR,BR,BL theo y rồi x"
+  },
+  "warp": {
+    "plate_margin": 0.08,
+    "interpolation": "INTER_LINEAR",
+    "border": "BORDER_CONSTANT 0 (RGB, không alpha)",
+    "plate_size": "round((|TL-TR|+|BL-BR|)/2), round((|TL-BL|+|TR-BR|)/2)",
+    "canvas": "round(plate*(1+2m)), pad = round(plate*m); dst = [pad, pad+plate-1]",
+    "rounding": "làm tròn .5 lên"
+  },
+  "stage2": {
+    "model": "stage2_wells.onnx",
+    "input": "images",
+    "output": "output0",
+    "img_size": 640,
+    "letterbox_pad": 114,
+    "letterbox": "scale=min(640/h,640/w); new=round(w*s),round(h*s); left=(640-new_w)//2, top=(640-new_h)//2; resize INTER_LINEAR_EXACT",
+    "gray": "uint8 rồi /255",
+    "conf": 0.05,
+    "nms_iou": 0.15,
+    "max_det": 500,
+    "retry_interp_frac": 0.05,
+    "retry_stretch": [
+      1.0,
+      99.0
+    ],
+    "retry": "lưới nội suy > retry_interp_frac số ô -> YOLO lần 2 trên gray đã contrast_stretch(retry_stretch) (histogram percentile + LUT nguyên, acam.inference.contrast_stretch); giữ lần khớp nhiều ô hơn",
+    "output_format": "(1,5,8400): cx,cy,w,h (px khung 640), score"
+  },
+  "stage3": {
+    "model": "stage3_classifier.onnx",
+    "crop_size": 64,
+    "well_margin": 0.05,
+    "plate_ref_gray": 141.0,
+    "plate_gain_max": 2.5,
+    "plate_gain": "CNN: gain = clip(plate_ref_gray / trung vị (tổng gray uint8 crop / số pixel), 1, plate_gain_max); pixel (gray hoặc B,G,R) -> min(255, floor(v * gain + 0.5)) trước khi chia 255 (acam.models.stage3.plate_gain / gain_lut)",
+    "crop": "bbox nới margin mỗi phía, làm tròn .5 lên, kẹp trong ảnh; resize INTER_AREA; BGR uint8",
+    "family": "cnn",
+    "in_ch": 1,
+    "candidate": "cnn:gray",
+    "class_names": [
+      "Growth",
+      "NoGrowth",
+      "NoAgar"
+    ],
+    "class_prob_weights": [
+      1.0,
+      0.5,
+      1.0
+    ],
+    "cv_macro_f1": 0.8919
+  }
+}

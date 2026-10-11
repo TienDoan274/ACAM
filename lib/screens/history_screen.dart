@@ -10,55 +10,49 @@ class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
 
   @override
-  State<HistoryScreen> createState() => _HistoryScreenState();
+  State<HistoryScreen> createState() => HistoryScreenState();
 }
 
-class _HistoryScreenState extends State<HistoryScreen> {
+class HistoryScreenState extends State<HistoryScreen> {
   late Future<List<HistoryEntry>> _entriesFuture;
-  final dbHelper = DatabaseHelper();
+  final DatabaseHelper _db = DatabaseHelper();
+  List<ProjectEntry> _projects = [];
+  int? _selectedProjectId; // null = All, >0 = specific project
 
   @override
   void initState() {
     super.initState();
+    _loadProjects();
     _refreshHistory();
+  }
+
+  /// Called by MainScreen whenever the History tab becomes visible again
+  void refresh() {
+    _loadProjects();
+    _refreshHistory();
+  }
+
+  Future<void> _loadProjects() async {
+    try {
+      final projects = await _db.getAllProjects();
+      if (mounted) {
+        setState(() => _projects = projects);
+      }
+    } catch (e) {
+      print('[HistoryScreen] Error loading projects: $e');
+    }
   }
 
   void _refreshHistory() {
     setState(() {
-      _entriesFuture = dbHelper.getAllResults();
-    });
-  }
-
-  Future<void> _deleteEntry(int id) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Entry'),
-        content: const Text('Are you sure you want to delete this entry?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancel'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed == true) {
-      await dbHelper.deleteResult(id);
-      _refreshHistory();
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Entry deleted')),
-        );
+      if (_selectedProjectId == null) {
+        // All results
+        _entriesFuture = _db.getAllResults();
+      } else {
+        // Specific project
+        _entriesFuture = _db.getResultsByProject(_selectedProjectId!);
       }
-    }
+    });
   }
 
   Future<void> _viewEntry(HistoryEntry entry) async {
@@ -93,15 +87,25 @@ class _HistoryScreenState extends State<HistoryScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('History'),
+        toolbarHeight: 44,
+        title: const Text('History', style: TextStyle(fontSize: 16)),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
           IconButton(
-            icon: const Icon(Icons.delete_sweep),
+            icon: const Icon(Icons.delete_sweep, size: 20),
             onPressed: _clearAllHistory,
             tooltip: 'Clear All',
           ),
         ],
+        bottom: _projects.isNotEmpty
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(50),
+                child: SizedBox(
+                  height: 50,
+                  child: _buildFilterChips(),
+                ),
+              )
+            : null,
       ),
       body: FutureBuilder<List<HistoryEntry>>(
         future: _entriesFuture,
@@ -169,7 +173,6 @@ class _HistoryScreenState extends State<HistoryScreen> {
               return _HistoryCard(
                 entry: entry,
                 onView: () => _viewEntry(entry),
-                onDelete: () => _deleteEntry(entry.id!),
               );
             },
           );
@@ -199,27 +202,80 @@ class _HistoryScreenState extends State<HistoryScreen> {
     );
 
     if (confirmed == true) {
-      await dbHelper.deleteAllResults();
+      await _db.moveAllResultsToTrash();
       _refreshHistory();
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('History cleared')),
+          const SnackBar(content: Text('History cleared (moved to trash)')),
         );
       }
     }
+  }
+
+  Widget _buildFilterChips() {
+    return ListView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      children: [
+        // "All" chip
+        _FilterChip(
+          label: 'All',
+          isSelected: _selectedProjectId == null,
+          onSelected: () {
+            setState(() => _selectedProjectId = null);
+            _refreshHistory();
+          },
+        ),
+        // Project chips
+        ..._projects.map((project) => _FilterChip(
+              label: project.name,
+              isSelected: _selectedProjectId == project.id,
+              onSelected: () {
+                setState(() => _selectedProjectId = project.id);
+                _refreshHistory();
+              },
+            )),
+        const SizedBox(width: 8),
+      ],
+    );
+  }
+}
+
+class _FilterChip extends StatelessWidget {
+  final String label;
+  final bool isSelected;
+  final VoidCallback onSelected;
+
+  const _FilterChip({
+    required this.label,
+    required this.isSelected,
+    required this.onSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 8),
+      child: FilterChip(
+        label: Text(label),
+        selected: isSelected,
+        onSelected: (_) => onSelected(),
+        labelStyle: TextStyle(
+          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+        ),
+      ),
+    );
   }
 }
 
 class _HistoryCard extends StatelessWidget {
   final HistoryEntry entry;
   final VoidCallback onView;
-  final VoidCallback onDelete;
 
   const _HistoryCard({
     required this.entry,
     required this.onView,
-    required this.onDelete,
   });
 
   @override
@@ -231,23 +287,22 @@ class _HistoryCard extends StatelessWidget {
           backgroundColor: Theme.of(context).colorScheme.primaryContainer,
           child: Text('${entry.totalWells}'),
         ),
-        title: Text(entry.formattedDate),
-        subtitle: Text(entry.countsDisplay),
-        trailing: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            IconButton(
-              icon: const Icon(Icons.visibility),
-              onPressed: onView,
-              tooltip: 'View',
-            ),
-            IconButton(
-              icon: const Icon(Icons.delete),
-              onPressed: onDelete,
-              tooltip: 'Delete',
-              color: Colors.red,
-            ),
-          ],
+        title: Text(
+          entry.imagePath.split('/').last,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          '${entry.countsDisplay} · ${entry.formattedDate}'
+          '${entry.inTrash ? ' · In trash bin' : ''}',
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: IconButton(
+          icon: const Icon(Icons.visibility),
+          onPressed: onView,
+          tooltip: 'View',
         ),
       ),
     );

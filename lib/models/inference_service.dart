@@ -1,23 +1,69 @@
-/// Inference service - FULL PIPELINE với ONNX Runtime (3-mode detection + RF classify)
-/// - Stage 1: EfficientNet-B3 grid-corner regression (ONNX INT8) -> 4 corners
-/// - Stage 2: 3 modes
-///     A) autoGrid   : bilinear grid from corners
-///     B) manualGrid : 5-DOF similarity transform applied to base grid
-///     C) yoloDetect : YOLOv8n (ch=1) ONNX -> NMS -> 384 wells
-/// - Stage 3: ExtraTrees/RF ONNX classification (replaces brightness threshold)
+/// Inference service - FULL PIPELINE với ONNX Runtime, port 1-1 của `acam/inference.py` (repo cha).
+/// Mọi hằng số tiền xử lý / hậu xử lý đọc từ `assets/models/pipeline_config.json` (PipelineConfig),
+/// mọi phép ảnh dùng OpenCV (dartcv4) như `cv2` phía Python để kết quả khớp nhau.
+/// - Stage 1: EfficientNet-B3 hồi quy 4 góc plate (gray 896x896) -> warp plate (margin 8%, RGB, viền đen)
+/// - Stage 2: YOLOv8n 1 kênh trên plate đã warp (letterbox 640, pad 114) -> NMS -> WellGrid: ĐÚNG 384 well
+/// - Stage 3: phân loại Growth / NoGrowth / NoAgar trên crop 64x64 (bbox nới 5%, INTER_AREA);
+///            dự đoán = argmax(xác suất * class_prob_weights)
 library inference_service;
 
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:dartcv4/dartcv.dart' as cv;
 
 import '../utils/constants.dart';
+import '../utils/image_frame.dart';
 import '../utils/image_utils.dart';
 import '../utils/grid_transform.dart';
+import '../utils/pipeline_config.dart';
+import '../utils/plate_geometry.dart';
+import '../utils/well_grid.dart';
+import 'stage_meta.dart';
+
+/// Làm tròn .5 lên — giống `round_half_up` của acam/geometry.py (kể cả số âm).
+int _rhu(double x) => (x + 0.5).floor();
+
+/// img.Image -> cv.Mat CV_8UC3 (thứ tự kênh RGB). Ảnh có alpha / palette / 16-bit được đổi về RGB uint8.
+cv.Mat _toMatRgb(img.Image image) {
+  final im = (image.numChannels == 3 && image.format == img.Format.uint8 && !image.hasPalette)
+      ? image
+      : image.convert(format: img.Format.uint8, numChannels: 3);
+  return cv.Mat.fromList(im.height, im.width, cv.MatType.CV_8UC3, im.getBytes(order: img.ChannelOrder.rgb));
+}
+
+/// cv.Mat CV_8UC3 (RGB) -> img.Image 3 kênh.
+img.Image _fromMatRgb(cv.Mat m) => img.Image.fromBytes(
+    width: m.cols,
+    height: m.rows,
+    bytes: Uint8List.fromList(m.data).buffer,
+    numChannels: 3,
+    order: img.ChannelOrder.rgb);
+
+/// Kết quả Stage 3: class id + xác suất từng class (null với fallback độ sáng) + gain chuẩn hoá độ sáng theo plate
+/// (1 = ảnh bình thường, > 1 = ảnh tối đã được làm sáng trước khi phân loại).
+class Stage3Output {
+  final List<int> classes;
+  final List<List<double>>? probs;
+  final double gain;
+  Stage3Output(this.classes, this.probs, {this.gain = 1.0});
+
+  /// Độ tin cậy của class đã chọn (xác suất lớn nhất), 1.0 nếu không có xác suất.
+  List<double> get confidences =>
+      probs == null ? List.filled(classes.length, 1.0) : [for (var i = 0; i < classes.length; i++) probs![i][classes[i]]];
+}
+
+/// Isolate job: pure-Dart JPEG/PNG decode. A full-res photo takes seconds on
+/// the UI isolate, which starves input handling during pipeline runs.
+img.Image? _decodeImageJob(Uint8List bytes) => img.decodeImage(bytes);
+
+/// Isolate job: PNG encode (full-plate encodes take seconds).
+Uint8List _encodePngJob(img.Image image) =>
+    Uint8List.fromList(img.encodePng(image));
 
 /// Detection result (stage 1 + 2) — used by preview screen before classification.
 class DetectionResult {
@@ -58,8 +104,13 @@ class PipelineResult {
     required this.mode,
   });
 
+  /// Số well: số box nếu có; kết quả mở lại từ History không lưu box -> tổng số đếm 3 class.
+  int get totalWells => boxes.isNotEmpty
+      ? boxes.length
+      : (counts['growth'] ?? 0) + (counts['no_growth'] ?? 0) + (counts['no_agar'] ?? 0);
+
   String get countsDisplay =>
-      'Total: ${boxes.length} | Growth: ${counts['growth']} | '
+      'Total: $totalWells | Growth: ${counts['growth']} | '
       'NoGrowth: ${counts['no_growth']} | NoAgar: ${counts['no_agar']}';
 
   int getCount(String className) => counts[className] ?? 0;
@@ -87,31 +138,52 @@ class InferenceService {
 
   bool _isInitialized = false;
 
+  late PipelineConfig _cfg;
+  late WellGrid _grid;
+
   static final InferenceService _instance = InferenceService._internal();
   factory InferenceService() => _instance;
   InferenceService._internal();
 
   bool get isStage3Available => _stage3Available;
   bool get isStage2Available => _stage2Available && _stage2Loaded;
+  PipelineConfig get config => _cfg;
+  WellGrid get grid => _grid;
 
   /// Initialize Stage 1 + Stage 3 (Stage 2 lazy on YOLO mode).
   Future<bool> initialize() async {
     if (_isInitialized) return true;
     try {
       OrtEnv.instance.init();
+      _cfg = await PipelineConfig.load();
+      _grid = WellGrid(GridParamsDyn(
+        rows: _cfg.rows,
+        cols: _cfg.cols,
+        templateCornersUv: _cfg.templateCornersUv,
+        margin: _cfg.plateMargin,
+        gates: _cfg.gatesPitch,
+        snapTol: _cfg.snapTolPitch,
+        maxRefine: _cfg.maxRefine,
+        minConf: _cfg.coarseAlignMinConf,
+        scaleMin: _cfg.coarseScaleMin,
+        scaleMax: _cfg.coarseScaleMax,
+        phaseRadius: _cfg.phaseRadius,
+        growRadii: _cfg.growRadii,
+        growHomographyFrom: _cfg.growHomographyFrom,
+      ));
 
-      // Stage 1: grid corners
-      _stage1Session = await _loadSession('assets/models/stage1_grid_fp32.onnx');
+      // Stage 1: 4 góc plate
+      _stage1Session = await _loadSession(_cfg.modelAsset(_cfg.stage1Model));
       _s1In = _stage1Session!.inputNames;
       _s1Out = _stage1Session!.outputNames;
       print('[Inference] Stage1 inputs=$_s1In outputs=$_s1Out');
 
-      // Stage 3: RF classifier (optional — fall back to brightness if missing)
+      // Stage 3: classifier (optional — fall back to brightness if missing)
       try {
-        _stage3Session = await _loadSession('assets/models/stage3_rf_fp32.onnx');
+        _stage3Session = await _loadSession(_cfg.modelAsset(_cfg.stage3Model));
         _s3In = _stage3Session!.inputNames;
         _s3Out = _stage3Session!.outputNames;
-        print('[Inference] Stage3 (RF) loaded inputs=$_s3In outputs=$_s3Out');
+        print('[Inference] Stage3 (${_cfg.stage3Family}) loaded inputs=$_s3In outputs=$_s3Out');
       } catch (e) {
         print('[Inference] Stage3 RF not available ($e) — will use brightness fallback');
         _stage3Available = false;
@@ -136,7 +208,7 @@ class InferenceService {
     if (_stage2Loaded) return true;
     if (!_stage2Available) return false;
     try {
-      _stage2Session = await _loadSession('assets/models/stage2_yolo.onnx');
+      _stage2Session = await _loadSession(_cfg.modelAsset(_cfg.stage2Model));
       _s2In = _stage2Session!.inputNames;
       _s2Out = _stage2Session!.outputNames;
       _stage2Loaded = true;
@@ -154,14 +226,12 @@ class InferenceService {
   // ─────────────────────────────────────────────
   Future<List<Map<String, double>>> runStage1(img.Image image) async {
     final sw = Stopwatch()..start();
-    final hOrig = image.height;
-    final wOrig = image.width;
 
     final swPre = Stopwatch()..start();
-    final input = _preprocessStage1(image);
+    final (input, frame) = _preprocessStage1(image);
     print('[Stage1] preprocess: ${swPre.elapsedMilliseconds}ms');
 
-    final shape = [1, 1, Stage1Params.imgSize, Stage1Params.imgSize];
+    final shape = [1, 1, _cfg.stage1Size, _cfg.stage1Size];
     final inputOrt = OrtValueTensor.createTensorWithDataList(input, shape);
     final inputs = {_s1In!.first: inputOrt};
     final runOpts = OrtRunOptions();
@@ -187,12 +257,11 @@ class InferenceService {
       throw Exception('Stage 1: unexpected output type ${raw.runtimeType}');
     }
 
+    // Output chuẩn hoá theo khung Stage 1 -> px khung -> px ảnh (bỏ xoay / nền), như acam.inference.stage1_corners
     final corners = <Map<String, double>>[];
     for (var i = 0; i < 4; i++) {
-      corners.add({
-        'x': data[i * 2] * wOrig,
-        'y': data[i * 2 + 1] * hOrig,
-      });
+      final (x, y) = frame.toImage(data[i * 2] * frame.canvasW, data[i * 2 + 1] * frame.canvasH);
+      corners.add({'x': x, 'y': y});
     }
     inputOrt.release();
     runOpts.release();
@@ -208,7 +277,7 @@ class InferenceService {
   /// Returns corners + warped image + inverse matrix for Stage 2 YOLO.
   Future<Stage1Result> detectCornersAndWarp(String imagePath) async {
     final sw = Stopwatch()..start();
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
 
     // Step 1: Run Stage 1 EfficientNet corner detection
     final swPre = Stopwatch()..start();
@@ -234,7 +303,7 @@ class InferenceService {
   /// Detect grid (Mode A: auto). Returns corners + positions + diameter.
   Future<DetectionResult> detectAutoGrid(String imagePath) async {
     final sw = Stopwatch()..start();
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
     final corners = await runStage1(image);
 
     final positions = ImageUtils.bilinearInterpolateGrid(
@@ -265,7 +334,7 @@ class InferenceService {
     final ok = await ensureStage2Loaded();
     if (!ok) throw Exception('Stage 2 YOLO model unavailable');
     final sw = Stopwatch()..start();
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
 
     // Step 1: Warp image to canonical aligned plate (matches training data)
     final warped = _warpPlate(image, corners);
@@ -287,7 +356,7 @@ class InferenceService {
     }
 
     // Step 2: Run YOLO on warped image
-    final warpedBoxes = await _runStage2YOLO(warped.image);
+    final warpedBoxes = await _detectWells384(warped.image);
 
     // Step 3: Map detections from warped coords back to original image coords
     final boxes = _unwarpBoxes(warpedBoxes, warped.dstToSrc, image.width.toDouble(), image.height.toDouble());
@@ -328,18 +397,18 @@ class InferenceService {
 
     final swTotal = Stopwatch()..start();
 
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
 
     // Step 1: Warp image to canonical aligned plate
     final warped = _warpPlate(image, corners);
 
     // Step 2: Run YOLO on warped image → boxes stay in WARPED coords (no unwarp)
     final swYOLO = Stopwatch()..start();
-    final warpedBoxes = await _runStage2YOLO(warped.image);
+    final warpedBoxes = await _detectWells384(warped.image);
     print('[YOLO-warped] YOLO inference: ${swYOLO.elapsedMilliseconds}ms');
 
     // Save warped image
-    final warpedBytes = Uint8List.fromList(img.encodePng(warped.image));
+    final warpedBytes = await compute(_encodePngJob, warped.image);
     final warpedFileName = 'warped_plate_${DateTime.now().millisecondsSinceEpoch}.png';
     final warpedFile = await ImageUtils.saveImage(warpedBytes, warpedFileName);
 
@@ -383,7 +452,7 @@ class InferenceService {
 
     // Run YOLO directly on warped image
     final swYOLO = Stopwatch()..start();
-    final warpedBoxes = await _runStage2YOLO(warpedImage);
+    final warpedBoxes = await _detectWells384(warpedImage);
     print('[YOLO-warped] YOLO inference: ${swYOLO.elapsedMilliseconds}ms');
 
     // Save warped image (for debugging)
@@ -419,12 +488,125 @@ class InferenceService {
   }
 
   // ─────────────────────────────────────────────
-  // STAGE 2c: YOLO inference + NMS
+  // STAGE 2: YOLO + NMS + hoàn thiện lưới 384
   // ─────────────────────────────────────────────
-  Future<List<Map<String, dynamic>>> _runStage2YOLO(img.Image image) async {
-    final lb = _preprocessYolo(image);
+  /// YOLO trên plate đã warp -> WellGrid -> ĐÚNG 384 box (thứ tự lưới). Mỗi box có thêm
+  /// 'interpolated' (không có detection, vị trí từ lưới) và 'snapped' (detection lệch, dùng vị trí lưới).
+  Future<List<Map<String, dynamic>>> _detectWells384(img.Image warped) async {
+    final dets = await _yoloDets(warped);
+    final r = _grid.complete(dets, warped.width.toDouble(), warped.height.toDouble());
+    print('[Grid] ${r.nDet} det -> 384 wells: ${r.nInterpolated} noi suy, ${r.nDropped} box thua bi loai, shift=${r.shift}');
+    return _boxesFromGrid(r);
+  }
+
+  Future<List<Det>> _yoloDets(img.Image warped, {bool stretch = false}) async {
+    final raw = await _runStage2YOLO(warped, stretch: stretch);
+    return [for (final b in raw) Det(b['x1'] as double, b['y1'] as double, b['x2'] as double, b['y2'] as double, b['conf'] as double)];
+  }
+
+  List<Map<String, dynamic>> _boxesFromGrid(GridResult r) => [
+        for (var i = 0; i < r.boxes.length; i++)
+          {
+            'x1': r.boxes[i][0],
+            'y1': r.boxes[i][1],
+            'x2': r.boxes[i][2],
+            'y2': r.boxes[i][3],
+            'conf': r.conf[i],
+            'interpolated': !r.detected[i],
+            'snapped': r.snapped[i],
+          }
+      ];
+
+  // ─────────────────────────────────────────────
+  // Luồng v2 (PipelineWorkspaceScreen): mỗi stage chạy 1 lần, kết quả lưu ở Stage1Meta / Stage2Meta
+  // ─────────────────────────────────────────────
+  /// Decode ảnh (isolate) — ảnh gốc hoặc plate đã warp đã lưu.
+  Future<img.Image> loadImage(String path) => _decode(path);
+
+  /// Chỉ chạy model Stage 1 (không warp): góc TL,TR,BR,BL + kích thước ảnh đã decode.
+  /// Dùng để điền sẵn màn hình chỉnh góc khi chưa lưu góc (ảnh chạy Stage 1 trước bản v7).
+  Future<(List<Map<String, double>>, int, int)> detectCorners(String imagePath) async {
+    final image = await _decodePhoto(imagePath);
+    return (await runStage1(image), image.width, image.height);
+  }
+
+  /// Stage 1: [corners] null -> model dự đoán; có -> góc chỉnh tay. Warp + lưu PNG + kiểm tra chất lượng.
+  Future<Stage1Output> stage1Warp(String imagePath, {List<Map<String, double>>? corners}) async {
+    final image = await _decodePhoto(imagePath);
+    final auto = corners == null ? await runStage1(image) : null;
+    final use = orderCorners(corners ?? auto!);
+    final warped = _warpPlate(image, use);
+    final bytes = await compute(_encodePngJob, warped.image);
+    final file = await ImageUtils.saveImage(bytes, 'warped_plate_${DateTime.now().millisecondsSinceEpoch}.png');
+    final qc = quadMetrics(use, image.width.toDouble(), image.height.toDouble());
+    return Stage1Output(
+      source: corners == null ? Stage1Meta.sourceAuto : Stage1Meta.sourceManual,
+      image: image,
+      corners: use,
+      warped: warped.image,
+      warpedPath: file.path,
+      qc: qc,
+      warn: corners == null ? stage1Warnings(qc, _cfg) : const [],
+    );
+  }
+
+  /// Stage 2 trên plate đã warp. [manual] null -> YOLO + WellGrid (đúng 384 ô). Có -> chế độ tay:
+  /// lưới 16x24 + refine + có YOLO -> lai (3 box hút về YOLO rồi complete); còn lại thuần hình học.
+  Future<Stage2Output> stage2Detect(img.Image warped, {ManualWells? manual}) async {
+    final w = warped.width.toDouble(), h = warped.height.toDouble();
+    final GridResult r;
+    final String source;
+    var stretched = false;
+    // Như OnnxPipeline.stage2_grid: lưới phải nội suy quá nhiều (ảnh tối / tương phản thấp) -> chạy lại YOLO trên
+    // ảnh kéo giãn tương phản, giữ kết quả khớp nhiều ô hơn.
+    Future<GridResult> withRetry(GridResult Function(List<Det>) fn) async {
+      final g = fn(await _yoloDets(warped));
+      if (g.nInterpolated <= _cfg.stage2RetryInterpFrac * g.boxes.length) return g;
+      final g2 = fn(await _yoloDets(warped, stretch: true));
+      final n1 = g.detected.where((d) => d).length, n2 = g2.detected.where((d) => d).length;
+      print('[Stage2] ${g.nInterpolated} noi suy -> chay lai YOLO tren anh keo gian tuong phan: $n1 -> $n2 o khop');
+      if (n2 <= n1) return g;
+      stretched = true;
+      return g2;
+    }
+
+    if (manual == null) {
+      if (!await ensureStage2Loaded()) throw Exception('Stage 2 YOLO model unavailable');
+      r = await withRetry((d) => _grid.complete(d, w, h));
+      source = Stage2Meta.sourceAuto;
+    } else if (manual.refine && _grid.isHybridCounts(manual.n12, manual.n13) && await ensureStage2Loaded()) {
+      r = await withRetry((d) => _grid.fromAnchorsRefined(d, w, h, manual.anchors, manual.n12, manual.n13));
+      source = Stage2Meta.sourceHybrid;
+    } else {
+      r = _grid.fromAnchors(manual.anchors, manual.n12, manual.n13);
+      source = Stage2Meta.sourceGeom;
+    }
+    final warn = source == Stage2Meta.sourceGeom
+        ? stage2Warnings(r.boxes.length, 0, 0, r.pitch, _cfg) // không có YOLO: chỉ kiểm độ phân giải
+        : [
+            ...stage2Warnings(r.boxes.length, r.nInterpolated, r.nSnapped, r.pitch, _cfg),
+            if (source == Stage2Meta.sourceHybrid && (r.shift[0] != 0 || r.shift[1] != 0)) 'grid_shifted',
+          ];
+    print('[Stage2] $source: ${r.rows}x${r.cols}, ${r.nDet} det, ${r.nInterpolated} noi suy, '
+        '${r.nSnapped} snap, shift=${r.shift}, warn=$warn');
+    return Stage2Output(source: source, boxes: _boxesFromGrid(r), grid: r, warn: warn, stretched: stretched);
+  }
+
+  /// Detection YOLO thô (chưa ghép lưới) trên ảnh [imagePath], toạ độ nhân (scaleX, scaleY). Màn hình
+  /// Manual wells chạy trên ảnh hiển thị ≤2048 px của plate đã warp (decode nhanh; YOLO vẫn resize về
+  /// 640) rồi đổi về px ảnh warp gốc: hiện chấm "well model tìm được" + chạm hút box vào đó.
+  /// [] nếu không có model YOLO.
+  Future<List<Det>> detectWellBoxes(String imagePath, {double scaleX = 1, double scaleY = 1}) async {
+    await initialize();
+    if (!await ensureStage2Loaded()) return const [];
+    final dets = await _yoloDets(await _decode(imagePath));
+    return [for (final d in dets) Det(d.x1 * scaleX, d.y1 * scaleY, d.x2 * scaleX, d.y2 * scaleY, d.conf)];
+  }
+
+  Future<List<Map<String, dynamic>>> _runStage2YOLO(img.Image image, {bool stretch = false}) async {
+    final lb = _preprocessYolo(image, stretch: stretch);
     final inp = lb.input;
-    final shape = [1, 1, 640, 640];
+    final shape = [1, 1, _cfg.stage2Size, _cfg.stage2Size];
     final inputOrt = OrtValueTensor.createTensorWithDataList(inp, shape);
     final inputs = {_s2In!.first: inputOrt};
     final runOpts = OrtRunOptions();
@@ -464,8 +646,8 @@ class InferenceService {
     final detections = <Map<String, dynamic>>[];
     for (var i = 0; i < n; i++) {
       final score = rows[4][i];
-      if (score < Stage2Params.conf) continue;
-      // Undo letterbox: subtract padding, divide by scale
+      if (score < _cfg.stage2Conf) continue;
+      // Bỏ letterbox: trừ pad (số nguyên, đúng như lúc dán ảnh), chia scale
       final cx = (rows[0][i] - lb.padX) / lb.scale;
       final cy = (rows[1][i] - lb.padY) / lb.scale;
       final w = rows[2][i] / lb.scale;
@@ -476,21 +658,27 @@ class InferenceService {
         'x2': cx + w / 2,
         'y2': cy + h / 2,
         'conf': score,
+        '_i': i,
       });
     }
-    print('[YOLO] raw detections (conf>${Stage2Params.conf}): ${detections.length}');
+    print('[YOLO] raw detections (conf>${_cfg.stage2Conf}): ${detections.length}');
 
-    final kept = _nms(detections, Stage2Params.iou);
-    print('[YOLO] after NMS (iou=${Stage2Params.iou}): ${kept.length}');
-    // cap at maxDet
-    final result = kept.length > Stage2Params.maxDet
-        ? kept.sublist(0, Stage2Params.maxDet)
-        : kept;
+    final kept = _nms(detections, _cfg.stage2Iou);
+    print('[YOLO] after NMS (iou=${_cfg.stage2Iou}): ${kept.length}');
+    final result = kept.length > _cfg.stage2MaxDet ? kept.sublist(0, _cfg.stage2MaxDet) : kept;
+    for (final b in result) {
+      b.remove('_i');
+    }
     return result;
   }
 
+  /// Greedy NMS như acam/inference.py: sắp conf giảm dần (ỔN ĐỊNH — hoà thì theo thứ tự anchor),
+  /// bỏ box có IoU > ngưỡng với box đã giữ.
   List<Map<String, dynamic>> _nms(List<Map<String, dynamic>> boxes, double iouThresh) {
-    boxes.sort((a, b) => (b['conf'] as double).compareTo(a['conf'] as double));
+    boxes.sort((a, b) {
+      final c = (b['conf'] as double).compareTo(a['conf'] as double);
+      return c != 0 ? c : (a['_i'] as int? ?? 0).compareTo(b['_i'] as int? ?? 0);
+    });
     final kept = <Map<String, dynamic>>[];
     final suppressed = List<bool>.filled(boxes.length, false);
     for (var i = 0; i < boxes.length; i++) {
@@ -523,87 +711,125 @@ class InferenceService {
   }
 
   // ─────────────────────────────────────────────
-  // STAGE 3: classify 384 wells (RF ONNX or brightness fallback)
+  // STAGE 3: phân loại 384 well (ONNX CNN / cây quyết định, fallback độ sáng)
   // ─────────────────────────────────────────────
-  Future<List<int>> classifyWells(
-      img.Image image, List<Map<String, dynamic>> boxes) async {
-    if (_stage3Session != null) {
-      return _classifyWellsRF(image, boxes);
-    }
-    return _classifyWellsBrightness(image, boxes);
-  }
+  /// Chỉ trả class id (API cũ). Dùng [classifyWellsDetailed] để lấy thêm xác suất.
+  Future<List<int>> classifyWells(img.Image image, List<Map<String, dynamic>> boxes) async =>
+      (await classifyWellsDetailed(image, boxes)).classes;
 
-  Future<List<int>> _classifyWellsRF(
-      img.Image image, List<Map<String, dynamic>> boxes) async {
-    final size = Stage3Params.cropSize; // 64
-    // Build batch feature matrix: [N, 4096] /255
+  Future<Stage3Output> classifyWellsDetailed(img.Image image, List<Map<String, dynamic>> boxes) async {
+    if (_stage3Session == null || boxes.isEmpty) {
+      return Stage3Output(_classifyWellsBrightness(image, boxes), null);
+    }
+    final sw = Stopwatch()..start();
+    final size = _cfg.stage3CropSize;
     final n = boxes.length;
-    final features = Float32List(n * size * size);
-    for (var i = 0; i < n; i++) {
-      final f = _cropWellFeature(image, boxes[i], size);
-      // f is Float32List(4096), values 0..1
-      for (var j = 0; j < f.length; j++) {
-        features[i * size * size + j] = f[j];
+    final mat = _toMatRgb(image);
+    final List<int> shape;
+    final Float32List input;
+    var gain = 1.0;
+    if (_cfg.stage3Family == 'cnn') {
+      // (N, C, 64, 64): C=3 theo thứ tự B,G,R (như crop cv2 lúc train) hoặc C=1 gray; chia 255.
+      // Lần 1: crop + tổng gray từng crop -> gain chuẩn hoá độ sáng theo plate (như acam.models.stage3.plate_gain);
+      // lần 2: pixel qua LUT gain rồi chia 255 (như crops_to_array(..., gain)).
+      final c = _cfg.stage3InCh;
+      final datas = <Uint8List>[];
+      final sums = <int>[];
+      for (var i = 0; i < n; i++) {
+        final crop = _wellCrop64(mat, boxes[i]);
+        final g = cv.cvtColor(crop, cv.COLOR_RGB2GRAY);
+        final gd = g.data;
+        var s = 0;
+        for (final v in gd) {
+          s += v;
+        }
+        sums.add(s);
+        datas.add(Uint8List.fromList(c == 1 ? gd : crop.data)); // c=3: RGB xen kẽ
+        g.dispose();
+        crop.dispose();
       }
+      gain = plateGain(sums, size * size, _cfg.stage3PlateRefGray, _cfg.stage3PlateGainMax);
+      final lut = gainLut(gain);
+      input = Float32List(n * c * size * size);
+      for (var i = 0; i < n; i++) {
+        final d = datas[i];
+        final off = i * c * size * size;
+        if (c == 1) {
+          for (var k = 0; k < size * size; k++) {
+            input[off + k] = lut[d[k]] / 255.0;
+          }
+        } else {
+          for (var k = 0; k < size * size; k++) {
+            input[off + k] = lut[d[k * 3 + 2]] / 255.0; // B
+            input[off + size * size + k] = lut[d[k * 3 + 1]] / 255.0; // G
+            input[off + 2 * size * size + k] = lut[d[k * 3]] / 255.0; // R
+          }
+        }
+      }
+      shape = [n, c, size, size];
+    } else if (_cfg.stage3FeatureSet == 'gray64' || _cfg.stage3FeatureSet == 'app_v1') {
+      input = Float32List(n * size * size);
+      for (var i = 0; i < n; i++) {
+        final crop = _wellCrop64(mat, boxes[i]);
+        final g = cv.cvtColor(crop, cv.COLOR_RGB2GRAY);
+        final d = g.data;
+        for (var k = 0; k < size * size; k++) {
+          input[i * size * size + k] = d[k] / 255.0;
+        }
+        g.dispose();
+        crop.dispose();
+      }
+      shape = [n, size * size];
+    } else {
+      mat.dispose();
+      throw UnsupportedError('Stage 3: bo dac trung "${_cfg.stage3FeatureSet}" chua duoc port sang Dart');
     }
+    mat.dispose();
 
-    final shape = [n, size * size];
-    final inputOrt = OrtValueTensor.createTensorWithDataList(features, shape);
-    final inputs = {_s3In!.first: inputOrt};
+    final inputOrt = OrtValueTensor.createTensorWithDataList(input, shape);
     final runOpts = OrtRunOptions();
-    final outputs = await _stage3Session!.runAsync(runOpts, inputs);
+    final outputs = await _stage3Session!.runAsync(runOpts, {_s3In!.first: inputOrt});
     inputOrt.release();
     runOpts.release();
-    if (outputs == null || outputs.isEmpty || outputs[0] == null) {
-      throw Exception('Stage 3 RF: no output');
-    }
-
-    final raw = outputs[0]!.value;
-    // Flatten nested: [[label0, label1, ...]] or [label0, label1, ...]
-    final List<int> predList;
-    if (raw is List && raw.isNotEmpty && raw[0] is List) {
-      predList = (raw[0] as List).map((e) => (e as num).toInt()).toList();
-    } else if (raw is List) {
-      predList = raw.map((e) => (e as num).toInt()).toList();
-    } else {
-      throw Exception('Stage 3 RF: unexpected output type ${raw.runtimeType}');
-    }
-    final classes = predList;
+    if (outputs == null || outputs.isEmpty) throw Exception('Stage 3: no output');
+    // CNN: 1 output 'probabilities'; cây (skl2onnx): 'label', 'probabilities'
+    final pIdx = _s3Out!.indexOf('probabilities');
+    final raw = outputs[pIdx < 0 ? outputs.length - 1 : pIdx]!.value as List;
     for (final o in outputs) {
       o?.release();
     }
-    return classes;
+    final probs = [for (final row in raw) [for (final v in row as List) (v as num).toDouble()]];
+    final w = _cfg.classProbWeights;
+    final classes = <int>[];
+    for (final p in probs) {
+      var best = 0;
+      for (var k = 1; k < p.length; k++) {
+        if (p[k] * w[k] > p[best] * w[best]) best = k;
+      }
+      classes.add(best);
+    }
+    print('[Stage3] ${_cfg.stage3Family}: $n wells ${sw.elapsedMilliseconds}ms, gain ${gain.toStringAsFixed(3)}');
+    return Stage3Output(classes, probs, gain: gain);
   }
 
-  /// Crop one well to (size x size) grayscale, flattened, normalized /255.
-  Float32List _cropWellFeature(
-      img.Image image, Map<String, dynamic> box, int size) {
-    final x1 = box['x1']!.round().clamp(0, image.width - 1);
-    final y1 = box['y1']!.round().clamp(0, image.height - 1);
-    final x2 = box['x2']!.round().clamp(1, image.width);
-    final y2 = box['y2']!.round().clamp(1, image.height);
-    final cw = x2 - x1;
-    final ch = y2 - y1;
-    if (cw <= 0 || ch <= 0) {
-      return Float32List(size * size); // zeros
+  /// Crop chuẩn Stage 3 (như acam.models.stage3.well_crop64): bbox nới margin mỗi phía, làm tròn .5 lên,
+  /// kẹp trong ảnh -> resize size x size INTER_AREA. Trả Mat RGB (caller dispose).
+  cv.Mat _wellCrop64(cv.Mat rgb, Map<String, dynamic> box) {
+    final size = _cfg.stage3CropSize;
+    final m = _cfg.stage3WellMargin;
+    final x1 = (box['x1'] as num).toDouble(), y1 = (box['y1'] as num).toDouble();
+    final x2 = (box['x2'] as num).toDouble(), y2 = (box['y2'] as num).toDouble();
+    final cx = (x1 + x2) / 2, cy = (y1 + y2) / 2;
+    final hw = (x2 - x1) * (1 + 2 * m) / 2, hh = (y2 - y1) * (1 + 2 * m) / 2;
+    final a = math.max(0, _rhu(cx - hw)), b = math.max(0, _rhu(cy - hh));
+    final c = math.min(rgb.cols, _rhu(cx + hw)), d = math.min(rgb.rows, _rhu(cy + hh));
+    if (c - a < 2 || d - b < 2) {
+      return cv.Mat.zeros(size, size, cv.MatType.CV_8UC3);
     }
-    // crop
-    final cropped = img.copyCrop(image, x: x1, y: y1, width: cw, height: ch);
-    // resize to size x size
-    final resized = img.copyResize(cropped, width: size, height: size,
-        interpolation: img.Interpolation.linear);
-    // grayscale + flatten /255
-    final bytes = resized.getBytes(order: img.ChannelOrder.rgba);
-    final feat = Float32List(size * size);
-    int idx = 0;
-    for (int i = 0; i < bytes.length; i += 4) {
-      final r = bytes[i];
-      final g = bytes[i + 1];
-      final b = bytes[i + 2];
-      final gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      feat[idx++] = gray / 255.0;
-    }
-    return feat;
+    final roi = rgb.region(cv.Rect(a, b, c - a, d - b));
+    final out = cv.resize(roi, (size, size), interpolation: cv.INTER_AREA);
+    roi.dispose();
+    return out;
   }
 
   // ─────────────────────────────────────────────
@@ -624,8 +850,17 @@ class InferenceService {
 
     // Draw color-coded overlay on the warped plate
     final swDraw = Stopwatch()..start();
-    final annotated = ImageUtils.drawWellBoxes(
+    var annotated = ImageUtils.drawWellBoxes(
         detection.warpedImage, detection.warpedBoxes, classes);
+    // Full-res warp can exceed 4096px — over GLES max texture size, which
+    // stalls the raster thread (scroll freeze) when the image is displayed.
+    const maxDim = 2048;
+    if (annotated.width > maxDim || annotated.height > maxDim) {
+      final scale = maxDim / math.max(annotated.width, annotated.height);
+      annotated = img.copyResize(annotated,
+          width: (annotated.width * scale).round(),
+          height: (annotated.height * scale).round());
+    }
     final annotatedBytes = Uint8List.fromList(img.encodePng(annotated));
     final annotatedFile = await ImageUtils.saveImage(
         annotatedBytes, 'annotated_warped_${DateTime.now().millisecondsSinceEpoch}.png');
@@ -662,10 +897,10 @@ class InferenceService {
     String imagePath,
     List<Map<String, double>> corners,
   ) async {
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
     final warped = _warpPlate(image, corners);
 
-    final bytes = Uint8List.fromList(img.encodePng(warped.image));
+    final bytes = await compute(_encodePngJob, warped.image);
     final filename = 'warped_plate_${DateTime.now().millisecondsSinceEpoch}.png';
     final file = await ImageUtils.saveImage(bytes, filename);
     return file.path;
@@ -682,7 +917,7 @@ class InferenceService {
     GridTransform? transform,
   }) async {
     final sw = Stopwatch()..start();
-    final image = await _decode(imagePath);
+    final image = await _decodePhoto(imagePath);
 
     // Determine final boxes
     List<Map<String, dynamic>> boxes;
@@ -735,78 +970,99 @@ class InferenceService {
   Future<img.Image> _decode(String imagePath) async {
     final sw = Stopwatch()..start();
     final bytes = await File(imagePath).readAsBytes();
-    final image = img.decodeImage(bytes);
+    final image = await compute(_decodeImageJob, bytes);
     if (image == null) throw Exception('Failed to decode image');
     print('[Decode] image: ${sw.elapsedMilliseconds}ms (${image.width}x${image.height})');
     return image;
   }
 
-  Float32List _preprocessStage1(img.Image image) {
-    final size = Stage1Params.imgSize;
-    final resized = img.copyResize(image,
-        width: size, height: size, interpolation: img.Interpolation.linear);
-    final bytes = resized.getBytes(order: img.ChannelOrder.rgba);
-    final input = Float32List(size * size);
-    int idx = 0;
-    for (int i = 0; i < bytes.length; i += 4) {
-      final r = bytes[i];
-      final g = bytes[i + 1];
-      final b = bytes[i + 2];
-      final gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      input[idx++] = (gray / 255.0 - Stage1Params.mean) / Stage1Params.std;
+  /// Ảnh chụp (mọi nguồn): decode + giới hạn độ phân giải — như acam.inference.limit_resolution: cạnh dài >
+  /// max_image_side -> thu nhỏ INTER_AREA (OpenCV). Kết quả là "ảnh làm việc": mọi toạ độ Stage 1 theo ảnh này.
+  /// (Ảnh warp / ảnh hiển thị đã lưu dùng [_decode]: toạ độ box theo đúng kích thước file.)
+  Future<img.Image> _decodePhoto(String imagePath) async {
+    final image = await _decode(imagePath);
+    final (nw, nh) = workingSize(image.width, image.height, _cfg.maxImageSide);
+    if (nw == image.width && nh == image.height) return image;
+    final sw = Stopwatch()..start();
+    final src = _toMatRgb(image);
+    final dst = cv.resize(src, (nw, nh), interpolation: cv.INTER_AREA);
+    final out = _fromMatRgb(dst);
+    src.dispose();
+    dst.dispose();
+    print('[Decode] ${image.width}x${image.height} -> ${nw}x$nh (max ${_cfg.maxImageSide}px): ${sw.elapsedMilliseconds}ms');
+    return out;
+  }
+
+  /// Stage 1 (như acam.inference.stage1_input): gray (OpenCV, uint8) -> khung Stage 1 (ảnh dọc xoay 90° cùng chiều
+  /// kim đồng hồ; khung lệch 3:2 thêm nền = trung vị viền) -> resize size x size INTER_LINEAR_EXACT (không giữ tỉ lệ;
+  /// INTER_LINEAR của OpenCV ARM lệch x86 ±1 mức xám ở ~15% pixel -> góc lệch 1-3 px, bản EXACT giống hệt bit)
+  /// -> (x/255 - mean)/std. Trả kèm khung để đổi output về px ảnh.
+  (Float32List, Stage1Frame) _preprocessStage1(img.Image image) {
+    final size = _cfg.stage1Size;
+    final rgb = _toMatRgb(image);
+    var gray = cv.cvtColor(rgb, cv.COLOR_RGB2GRAY);
+    final frame = stage1Frame(image.width, image.height, _cfg.stage1CanvasAspect, _cfg.stage1AspectTol);
+    if (frame.rotate) {
+      final r = cv.rotate(gray, cv.ROTATE_90_CLOCKWISE);
+      gray.dispose();
+      gray = r;
     }
-    return input;
-  }
-
-  /// Letterbox preprocessing for YOLO (matches Ultralytics letterbox).
-  /// Preserves aspect ratio: resize + pad with gray (0.5) to 640x640.
-  /// Returns input tensor + letterbox params for unscaling detections.
-  YoloLetterbox _preprocessYolo(img.Image image) {
-    const size = 640;
-    final ow = image.width.toDouble();
-    final oh = image.height.toDouble();
-    final scale = math.min(size / ow, size / oh);
-    final newW = (ow * scale).round();
-    final newH = (oh * scale).round();
-    // Ultralytics centers the image; compute padding
-    final padW = (size - newW) / 2;
-    final padH = (size - newH) / 2;
-
-    // Resize preserving aspect ratio
-    final resized = img.copyResize(image,
-        width: newW, height: newH, interpolation: img.Interpolation.linear);
-
-    // Create 640x640 canvas filled with gray (0.5 * 255 = 127.5 → 128)
-    final canvas = img.Image(width: size, height: size);
-    img.fill(canvas, color: img.ColorRgba8(128, 128, 128, 255));
-    // Paste resized image at pad offset
-    final px = padW.round();
-    final py = padH.round();
-    img.compositeImage(canvas, resized, dstX: px, dstY: py);
-
-    // Grayscale + normalize
-    final bytes = canvas.getBytes(order: img.ChannelOrder.rgba);
-    final input = Float32List(size * size);
-    int idx = 0;
-    for (int i = 0; i < bytes.length; i += 4) {
-      final r = bytes[i];
-      final g = bytes[i + 1];
-      final b = bytes[i + 2];
-      input[idx++] = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    if (frame.padded) {
+      final v = borderMedian(gray.data, gray.cols, gray.rows, _cfg.stage1PadBorderFrac);
+      final p = cv.copyMakeBorder(gray, frame.top, frame.bottom, frame.left, frame.right, cv.BORDER_CONSTANT,
+          value: cv.Scalar.all(v.toDouble()));
+      gray.dispose();
+      gray = p;
     }
-    return YoloLetterbox(
-        input: input, scale: scale, padX: padW, padY: padH);
+    if (frame.rotate || frame.padded) {
+      print('[Stage1] frame ${image.width}x${image.height} -> ${frame.canvasW}x${frame.canvasH} '
+          '(rotate=${frame.rotate}, pad t${frame.top} b${frame.bottom} l${frame.left} r${frame.right})');
+    }
+    final resized = cv.resize(gray, (size, size), interpolation: cv.INTER_LINEAR_EXACT);
+    final d = resized.data;
+    final input = Float32List(size * size);
+    for (var i = 0; i < size * size; i++) {
+      input[i] = (d[i] / 255.0 - _cfg.stage1Mean) / _cfg.stage1Std;
+    }
+    rgb.dispose();
+    gray.dispose();
+    resized.dispose();
+    return (input, frame);
   }
 
-  List<Map<String, double>> _orderCorners(List<Map<String, double>> corners) {
-    final sortedByY = List<Map<String, double>>.from(corners)
-      ..sort((a, b) => a['y']!.compareTo(b['y']!));
-    final top2 = sortedByY.sublist(0, 2);
-    final bottom2 = sortedByY.sublist(2);
-    top2.sort((a, b) => a['x']!.compareTo(b['x']!));
-    bottom2.sort((a, b) => a['x']!.compareTo(b['x']!));
-    return [top2[0], top2[1], bottom2[1], bottom2[0]]; // TL,TR,BR,BL
+  /// Letterbox cho YOLO (như acam.inference.letterbox): gray -> resize giữ tỉ lệ (INTER_LINEAR_EXACT)
+  /// -> đặt vào khung size x size, phần thừa = pad (114, như Ultralytics lúc train) -> /255.
+  YoloLetterbox _preprocessYolo(img.Image image, {bool stretch = false}) {
+    final size = _cfg.stage2Size;
+    final ow = image.width, oh = image.height;
+    final scale = math.min(size / oh, size / ow);
+    final newW = _rhu(ow * scale), newH = _rhu(oh * scale);
+    final left = (size - newW) ~/ 2, top = (size - newH) ~/ 2;
+    final rgb = _toMatRgb(image);
+    var gray = cv.cvtColor(rgb, cv.COLOR_RGB2GRAY);
+    if (stretch) {
+      // Lần chạy lại cho ảnh tối / tương phản thấp (như acam.inference.contrast_stretch)
+      final s = contrastStretch(gray.data, _cfg.stage2RetryStretch[0], _cfg.stage2RetryStretch[1]);
+      final g2 = cv.Mat.fromList(gray.rows, gray.cols, cv.MatType.CV_8UC1, s);
+      gray.dispose();
+      gray = g2;
+    }
+    final resized = cv.resize(gray, (newW, newH), interpolation: cv.INTER_LINEAR_EXACT);
+    final boxed = cv.copyMakeBorder(resized, top, size - newH - top, left, size - newW - left, cv.BORDER_CONSTANT,
+        value: cv.Scalar.all(_cfg.stage2Pad.toDouble()));
+    final d = boxed.data;
+    final input = Float32List(size * size);
+    for (var i = 0; i < size * size; i++) {
+      input[i] = d[i] / 255.0;
+    }
+    rgb.dispose();
+    gray.dispose();
+    resized.dispose();
+    boxed.dispose();
+    return YoloLetterbox(input: input, scale: scale, padX: left.toDouble(), padY: top.toDouble());
   }
+
+  List<Map<String, double>> _orderCorners(List<Map<String, double>> corners) => orderCorners(corners); // TL,TR,BR,BL
 
   /// Brightness fallback (used only if RF model unavailable).
   List<int> _classifyWellsBrightness(
@@ -864,47 +1120,36 @@ class InferenceService {
     final wBot = _dist(bl, br);
     final hLeft = _dist(tl, bl);
     final hRight = _dist(tr, br);
-    final plateW = ((wTop + wBot) / 2).round();
-    final plateH = ((hLeft + hRight) / 2).round();
+    // Như acam.geometry.canonical_warp_params: làm tròn .5 lên
+    final plateW = _rhu((wTop + wBot) / 2);
+    final plateH = _rhu((hLeft + hRight) / 2);
 
-    final margin = GridParams.margin;
-    final outW = (plateW * (1 + 2 * margin)).round();
-    final outH = (plateH * (1 + 2 * margin)).round();
-    final padX = (plateW * margin).round();
-    final padY = (plateH * margin).round();
+    final margin = _cfg.plateMargin;
+    final outW = _rhu(plateW * (1 + 2 * margin));
+    final outH = _rhu(plateH * (1 + 2 * margin));
+    final padX = _rhu(plateW * margin);
+    final padY = _rhu(plateH * margin);
 
     print('[Warp OpenCV] plateW=$plateW plateH=$plateH outW=$outW outH=$outH');
 
-    // Create cv.Mat DIRECTLY from raw RGBA bytes (no PNG encode/decode!).
-    // Mat.fromList copies the data once — far cheaper than PNG compression.
-    final rgbaBytes = image.getBytes(order: img.ChannelOrder.rgba);
-    final srcMat = cv.Mat.fromList(
-      image.height,
-      image.width,
-      cv.MatType.CV_8UC4,
-      rgbaBytes,
-    );
+    // Ảnh RGB 3 kênh (không alpha): vùng ngoài ảnh gốc = 0 (đen) như lúc train
+    final srcMat = _toMatRgb(image);
 
-    // Source corners (VecPoint - integer points for getPerspectiveTransform)
-    final srcPoints = cv.VecPoint.fromList([
-      cv.Point(tl['x']!.toInt(), tl['y']!.toInt()),
-      cv.Point(tr['x']!.toInt(), tr['y']!.toInt()),
-      cv.Point(br['x']!.toInt(), br['y']!.toInt()),
-      cv.Point(bl['x']!.toInt(), bl['y']!.toInt()),
+    // Góc nguồn giữ nguyên số thực (float32) như cv2.getPerspectiveTransform bên Python
+    final srcPoints = cv.VecPoint2f.fromList([
+      cv.Point2f(tl['x']!, tl['y']!),
+      cv.Point2f(tr['x']!, tr['y']!),
+      cv.Point2f(br['x']!, br['y']!),
+      cv.Point2f(bl['x']!, bl['y']!),
     ]);
-
-    // Destination corners (with margin)
-    final dstPoints = cv.VecPoint.fromList([
-      cv.Point(padX, padY),
-      cv.Point(padX + plateW - 1, padY),
-      cv.Point(padX + plateW - 1, padY + plateH - 1),
-      cv.Point(padX, padY + plateH - 1),
+    final dstPoints = cv.VecPoint2f.fromList([
+      cv.Point2f(padX.toDouble(), padY.toDouble()),
+      cv.Point2f((padX + plateW - 1).toDouble(), padY.toDouble()),
+      cv.Point2f((padX + plateW - 1).toDouble(), (padY + plateH - 1).toDouble()),
+      cv.Point2f(padX.toDouble(), (padY + plateH - 1).toDouble()),
     ]);
+    final M = cv.getPerspectiveTransform2f(srcPoints, dstPoints);
 
-    // Get perspective transform matrix
-    final M = cv.getPerspectiveTransform(srcPoints, dstPoints);
-
-    // Warp perspective on the 4-channel RGBA Mat (OpenCV handles all channels).
     final warpedMat = cv.warpPerspective(
       srcMat,
       M,
@@ -927,20 +1172,14 @@ class InferenceService {
       M.at<double>(2, 2),
     ]);
 
-    // Extract raw RGBA bytes DIRECTLY from the warped Mat (no PNG!).
-    // mat.data is a zero-copy view over native memory; copy it before disposing.
-    final warpedBytes = Uint8List.fromList(warpedMat.data);
-    final warped = img.Image.fromBytes(
-      width: outW,
-      height: outH,
-      bytes: warpedBytes.buffer,
-      order: img.ChannelOrder.rgba,
-    );
+    // mat.data là view vào bộ nhớ native -> _fromMatRgb copy trước khi dispose
+    final warped = _fromMatRgb(warpedMat);
 
-    // Cleanup OpenCV Mats
     srcMat.dispose();
     warpedMat.dispose();
     M.dispose();
+    srcPoints.dispose();
+    dstPoints.dispose();
 
     sw.stop();
     print('[Warp OpenCV] took: ${sw.elapsedMilliseconds}ms (${outW}x${outH}=${outW * outH} pixels)');
@@ -1100,6 +1339,47 @@ class InferenceService {
     }
     return x;
   }
+}
+
+/// Stage 1 (luồng v2): ảnh gốc đã decode, góc đã sắp TL,TR,BR,BL, plate đã warp (bộ nhớ + PNG), QC.
+class Stage1Output {
+  final String source; // Stage1Meta.sourceAuto | sourceManual
+  final img.Image image;
+  final List<Map<String, double>> corners;
+  final img.Image warped;
+  final String warpedPath;
+  final QuadMetrics qc;
+  final List<String> warn;
+  Stage1Output({
+    required this.source,
+    required this.image,
+    required this.corners,
+    required this.warped,
+    required this.warpedPath,
+    required this.qc,
+    required this.warn,
+  });
+}
+
+/// Stage 2 (luồng v2): box (map x1,y1,x2,y2,conf,interpolated,snapped), lưới + thống kê, cảnh báo.
+class Stage2Output {
+  final String source; // Stage2Meta.source*
+  final List<Map<String, dynamic>> boxes;
+  final GridResult grid;
+  final List<String> warn;
+  final bool stretched; // YOLO chạy lại trên ảnh kéo giãn tương phản (ảnh tối)
+  Stage2Output(
+      {required this.source, required this.boxes, required this.grid, required this.warn, this.stretched = false});
+
+  Map<String, dynamic> get stats => {
+        'n_det': grid.nDet,
+        'n_interpolated': grid.nInterpolated,
+        'n_snapped': grid.nSnapped,
+        'n_dropped': grid.nDropped,
+        'shift': grid.shift,
+        'pitch': double.parse(grid.pitch.toStringAsFixed(2)),
+        'stretched': stretched,
+      };
 }
 
 /// Result of perspective warp: warped image + inverse matrix (dst→src).

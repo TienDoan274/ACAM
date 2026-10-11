@@ -2,11 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-import 'screens/pipeline_screen.dart';
+import 'screens/projects_screen.dart';
 import 'screens/history_screen.dart';
-import 'screens/settings_screen.dart';
+import 'screens/trash_screen.dart';
 import 'models/inference_service.dart';
-import 'models/database_helper.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -41,6 +40,7 @@ class MicroplateAnalyzerApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Microplate Analyzer',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.green),
         useMaterial3: true,
@@ -48,7 +48,6 @@ class MicroplateAnalyzerApp extends StatelessWidget {
       home: const MainScreen(),
       routes: {
         '/history': (context) => const HistoryScreen(),
-        '/settings': (context) => const SettingsScreen(),
       },
     );
   }
@@ -62,18 +61,28 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
-  int _selectedIndex = 0;
+  int _selectedIndex = 0; // Start on Projects — work begins from a project
 
-  final List<Widget> _screens = [
-    const PipelineScreen(),
-    const HistoryScreen(),
-    const SettingsScreen(),
+  // Keys to trigger refresh when a tab becomes visible again
+  // (IndexedStack keeps screens mounted, so initState runs only once)
+  final _projectsKey = GlobalKey<ProjectsScreenState>();
+  final _historyKey = GlobalKey<HistoryScreenState>();
+  final _trashKey = GlobalKey<TrashScreenState>();
+
+  late final List<Widget> _screens = [
+    ProjectsScreen(key: _projectsKey),
+    HistoryScreen(key: _historyKey),
+    TrashScreen(key: _trashKey),
   ];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: _screens[_selectedIndex],
+      // IndexedStack keeps all screens mounted → state preserved across tab switches
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: _screens,
+      ),
       bottomNavigationBar: NavigationBar(
         height: 56,
         labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
@@ -82,19 +91,23 @@ class _MainScreenState extends State<MainScreen> {
           setState(() {
             _selectedIndex = index;
           });
+          // Refresh data-driven tabs when they become visible
+          if (index == 0) _projectsKey.currentState?.refresh();
+          if (index == 1) _historyKey.currentState?.refresh();
+          if (index == 2) _trashKey.currentState?.refresh();
         },
         destinations: const [
           NavigationDestination(
-            icon: Icon(Icons.analytics_outlined),
-            label: 'Pipeline',
+            icon: Icon(Icons.folder_outlined),
+            label: 'Projects',
           ),
           NavigationDestination(
             icon: Icon(Icons.history),
             label: 'History',
           ),
           NavigationDestination(
-            icon: Icon(Icons.settings),
-            label: 'Settings',
+            icon: Icon(Icons.delete_outline),
+            label: 'Trash',
           ),
         ],
       ),

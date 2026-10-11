@@ -1,6 +1,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application
-        android:label="microplate_analyzer"
+        android:label="Microplate Analyzer"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
@@ -30,6 +30,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- Impeller's OpenGLES backend stalls permanently on this device
+             (Vulkan init fails, fallback freezes when many images scroll in).
+             Force the legacy Skia renderer. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

@@ -11,6 +11,8 @@ https://github.com/user-attachments/assets/41e40dbf-7ac8-47a6-9cff-475079512d81
 Flutter Android application running a 3-stage microplate analysis pipeline using ONNX Runtime,
 equivalent to `full_pipeline.ipynb` but running directly on the phone.
 
+> 📘 **How to use the app:** see [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) (English, with screenshots).
+
 ## Pipeline Architecture (3 Stages)
 
 | Stage | Description | ONNX Model | Output |

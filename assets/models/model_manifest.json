@@ -1,0 +1,26 @@
+{
+ "stage1_corners.onnx": {
+  "source": "E:\\projects\\acam_asialab\\weights\\stage1\\best.pt",
+  "max_abs_diff": 4.0978193283081055e-07,
+  "epoch": 150,
+  "md5": "7c9e270d5941f88754c71a6a8f566157",
+  "size_mb": 46.4
+ },
+ "stage2_wells.onnx": {
+  "source": "E:\\projects\\acam_asialab\\weights\\stage2\\best.pt",
+  "max_abs_diff": 0.002410888671875,
+  "output_shape": [
+   1,
+   5,
+   8400
+  ],
+  "md5": "24c2b475ec00f0bf4a4e055c04ec33ea",
+  "size_mb": 10.97
+ },
+ "stage3_classifier.onnx": {
+  "family": "cnn",
+  "max_abs_diff": 3.0994415283203125e-06,
+  "size_mb": 0.24,
+  "md5": "94e105b82552a6bad6c09b1f6b88a002"
+ }
+}

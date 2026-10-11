@@ -84,12 +84,20 @@ class ImageUtils {
     return boxes;
   }
 
-  /// Draw well boxes on image with color coding
+  /// Draw well boxes on image with color coding.
+  ///
+  /// If [confidences] is provided (index-aligned with boxes), each box gets a
+  /// small "0.xx" confidence label drawn at its top-left corner.
+  /// [palette]: mã -> [r, g, b] thay màu mặc định (Stage 2: màu user chọn, Stage2Style);
+  /// [lineWidth]: độ dày viền (px), vẽ vào phía trong box.
   static img.Image drawWellBoxes(
     img.Image image,
     List<Map<String, dynamic>> boxes,
-    List<int> classes, // [0, 1, 2] for Growth, NoGrowth, NoAgar
-  ) {
+    List<int> classes, { // [0, 1, 2] for Growth, NoGrowth, NoAgar
+    Map<int, double>? confidences,
+    Map<int, List<int>>? palette,
+    int lineWidth = 1,
+  }) {
     final annotated = img.Image(
       width: image.width,
       height: image.height,
@@ -109,7 +117,8 @@ class ImageUtils {
       final cls = classes[i];
 
       // Color based on class
-      final color = _getClassColor(cls);
+      final custom = palette?[cls];
+      final color = custom != null ? {'r': custom[0], 'g': custom[1], 'b': custom[2]} : _getClassColor(cls);
 
       // Draw rectangle
       final x1 = box['x1']!.round().clamp(0, image.width - 1);
@@ -117,14 +126,17 @@ class ImageUtils {
       final x2 = box['x2']!.round().clamp(0, image.width - 1);
       final y2 = box['y2']!.round().clamp(0, image.height - 1);
 
-      // Draw rectangle outline
-      for (var x = x1; x <= x2; x++) {
-        annotated.setPixelRgba(x, y1, color['r']!, color['g']!, color['b']!, 255);
-        annotated.setPixelRgba(x, y2, color['r']!, color['g']!, color['b']!, 255);
-      }
-      for (var y = y1; y <= y2; y++) {
-        annotated.setPixelRgba(x1, y, color['r']!, color['g']!, color['b']!, 255);
-        annotated.setPixelRgba(x2, y, color['r']!, color['g']!, color['b']!, 255);
+      // Draw rectangle outline (lineWidth px, inward)
+      for (var t = 0; t < lineWidth && x1 + t <= x2 - t && y1 + t <= y2 - t; t++) {
+        final ax = x1 + t, ay = y1 + t, bx = x2 - t, by = y2 - t;
+        for (var x = ax; x <= bx; x++) {
+          annotated.setPixelRgba(x, ay, color['r']!, color['g']!, color['b']!, 255);
+          annotated.setPixelRgba(x, by, color['r']!, color['g']!, color['b']!, 255);
+        }
+        for (var y = ay; y <= by; y++) {
+          annotated.setPixelRgba(ax, y, color['r']!, color['g']!, color['b']!, 255);
+          annotated.setPixelRgba(bx, y, color['r']!, color['g']!, color['b']!, 255);
+        }
       }
 
       // Draw center dot
@@ -142,10 +154,100 @@ class ImageUtils {
           }
         }
       }
+
+      // Confidence label (drawn last so it stays on top)
+      if (confidences != null) {
+        final conf = confidences[i];
+        if (conf != null) {
+          _drawConfLabel(
+              annotated, x1, y1, conf.toStringAsFixed(2),
+              cr: color['r']!, cg: color['g']!, cb: color['b']!);
+        }
+      }
     }
 
     return annotated;
   }
+
+  /// Draw a tiny solid badge with the confidence text at the box's top-left.
+  /// Pixel-drawn text keeps it readable when zoomed without a bitmap font.
+  static void _drawConfLabel(
+    img.Image image,
+    int bx,
+    int by,
+    String text, {
+    required int cr,
+    required int cg,
+    required int cb,
+  }) {
+    // 3x5 digit/point glyphs packed as rows of bits (MSB left).
+    const glyphs = <String, List<int>>{
+      '0': [7, 5, 5, 5, 7],
+      '1': [2, 6, 2, 2, 7],
+      '2': [7, 1, 7, 4, 7],
+      '3': [7, 1, 7, 1, 7],
+      '4': [5, 5, 7, 1, 1],
+      '5': [7, 4, 7, 1, 7],
+      '6': [7, 4, 7, 5, 7],
+      '7': [7, 1, 2, 2, 2],
+      '8': [7, 5, 7, 5, 7],
+      '9': [7, 5, 7, 1, 7],
+      '.': [0, 0, 0, 0, 2],
+    };
+
+    const glyphW = 3, glyphH = 5, spacing = 1;
+    final totalW = text.length * (glyphW + spacing) - spacing;
+    final h = glyphH;
+
+    // Badge background block (black, slightly padded) so it reads on any plate
+    var ox = bx.clamp(0, image.width - 1);
+    var oy = (by - h - 4).clamp(0, image.height - 1);
+    for (var y = oy; y < oy + h + 2; y++) {
+      for (var x = ox; x < ox + totalW + 2; x++) {
+        if (x >= 0 && x < image.width && y >= 0 && y < image.height) {
+          image.setPixelRgba(x, y, 0, 0, 0, 255);
+        }
+      }
+    }
+
+    // Glyph pixels in white-ish tint of the class color
+    var px = ox + 1;
+    for (final ch in text.split('')) {
+      final g = glyphs[ch];
+      if (g == null) {
+        px += glyphW + spacing;
+        continue;
+      }
+      for (var row = 0; row < glyphH; row++) {
+        final bits = g[row];
+        for (var col = 0; col < glyphW; col++) {
+          if ((bits >> (glyphW - 1 - col)) & 1 == 1) {
+            final x = px + col;
+            final y = oy + 1 + row;
+            if (x >= 0 && x < image.width && y >= 0 && y < image.height) {
+              // Blend toward white so any class hue stays readable
+              final r = ((cr + 255) / 2).round().clamp(0, 255);
+              final gg = ((cg + 255) / 2).round().clamp(0, 255);
+              final b = ((cb + 255) / 2).round().clamp(0, 255);
+              image.setPixelRgba(x, y, r, gg, b, 255);
+            }
+          }
+        }
+      }
+      px += glyphW + spacing;
+    }
+  }
+
+  /// Mã màu preview Stage 2 (truyền như class vào [drawWellBoxes]); 0 = box YOLO (xanh lá).
+  static const int stage2Interpolated = 10, stage2Snapped = 11, stage2Manual = 12;
+
+  /// Mã màu Stage 2 cho từng box theo nguồn của nó.
+  static List<int> stage2VizCodes(List<Map<String, dynamic>> boxes, {bool manualGeom = false}) => [
+        for (final b in boxes)
+          manualGeom
+              ? stage2Manual
+              : (b['snapped'] == true ? stage2Snapped : (b['interpolated'] == true ? stage2Interpolated : 0))
+      ];
 
   /// Helper: get color components from class (returns map with 'r','g','b')
   static Map<String, int> _getClassColor(int cls) {
@@ -156,6 +258,13 @@ class ImageUtils {
         return {'r': 0, 'g': 0, 'b': 220};  // Red
       case 2: // NoAgar
         return {'r': 200, 'g': 0, 'b': 200}; // Purple
+      // Mã chỉ dùng cho ảnh preview Stage 2 (nguồn của từng box, chưa phân loại)
+      case stage2Interpolated: // không có detection YOLO, vị trí từ lưới
+        return {'r': 255, 'g': 140, 'b': 0}; // Orange
+      case stage2Snapped: // có detection nhưng lệch lưới -> dùng vị trí lưới
+        return {'r': 255, 'g': 215, 'b': 0}; // Yellow
+      case stage2Manual: // lưới sinh thuần hình học từ 3 box tay
+        return {'r': 0, 'g': 190, 'b': 255}; // Sky blue
       default:
         return {'r': 128, 'g': 128, 'b': 128}; // Gray
     }
